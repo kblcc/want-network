@@ -2,20 +2,27 @@
 
 **Stop searching. Just say what you want.**
 
-WANT is an early prototype for an intent-driven marketplace. Instead of users searching through sellers and listings, a user states what they want and providers can compete to fulfill that intent.
+WANT reverses search: people publish structured demand and providers compete to fulfill it.
 
-## MVP v0.1
+## Production v1 build
+This branch contains a real multi-user architecture (payments intentionally postponed):
+- Buyer/provider signup and login
+- Persistent WANTs
+- Provider marketplace
+- Real offers
+- Buyer offer acceptance
+- Status tracking
+- Row-level security
+- Notification data model
 
-The first prototype demonstrates:
-- Natural-language “I WANT…” input
-- Basic conversion into a structured intent
-- Budget and timing extraction
-- Example competitive offers
-- A provider-side view
-- Privacy-first principle: reveal the intent before revealing the person
+## Backend setup
+1. Create a Supabase project.
+2. Open SQL Editor and run `supabase/schema.sql` once.
+3. Copy `.env.example` to `.env` and add the project URL and **publishable/anon key** (never a service-role key).
+4. Run `npm install` then `npm run dev`.
 
-## Vision
+## Deployment
+Use a static frontend host with build command `npm run build`, output directory `dist`, and the two `VITE_SUPABASE_*` environment variables.
 
-The long-term idea is an Intent Network: a standard way for people, businesses, apps, and AI agents to express demand, discover compatible supply, exchange offers, and complete transactions.
-
-Current version is a prototype. Offers shown in the demo are simulated and no real transaction is performed yet.
+## Payments
+Not included yet by design.
