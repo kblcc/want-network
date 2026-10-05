@@ -93,7 +93,8 @@ async function signin(){
 async function dashboard(){
   if(!session)return auth('Sign in to open your dashboard.');
   if(profile?.role==='provider')return providerDash();
-  const {data:intents}=await supabase.from('intents').select('*,offers(*)').eq('buyer_id',session.user.id).order('created_at',{ascending:false});
+  const {data:intents,error}=await supabase.from('intents').select('*,offers!offers_intent_id_fkey(*)').eq('buyer_id',session.user.id).order('created_at',{ascending:false});
+  if(error){console.error('Dashboard load:',error);return shell(`<section class="card"><h2>Could not load your WANTs</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
   shell(`<section><div class="head"><div><p class="eyebrow">BUYER DASHBOARD</p><h2>My WANTs</h2></div><button type="button" class="primary" data-go="home">+ New WANT</button></div>${(intents||[]).map(i=>`<article class="card"><span class="pill">${i.status}</span><h3>${esc(i.description)}</h3><p>${i.location||'Location flexible'} • ${i.budget_max?'≤ $'+i.budget_max:'Budget open'}</p><h4>${i.offers.length} offer(s)</h4>${i.offers.map(o=>`<div class="offer"><div><b>$${o.amount}</b> ${esc(o.message||'')}</div>${i.status==='open'?`<button onclick="acceptOffer('${o.id}','${i.id}')">Accept</button>`:''}</div>`).join('')}</article>`).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
 }
 
