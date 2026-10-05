@@ -116,13 +116,13 @@ async function dashboard(){
 async function providerDash(){
   const [{data:intents,error:intentError},{data:offers,error:offerError}]=await Promise.all([
     supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false}),
-    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents!offers_intent_id_fkey(id,description,location,budget_max,deadline,status)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
+    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents!offers_intent_id_fkey(id,buyer_id,description,location,budget_max,deadline,status)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
   ]);
   const error=intentError||offerError;
   if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load provider dashboard</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
   const mine=new Map((offers||[]).map(o=>[o.intent_id,o]));
   const market=(intents||[]).map(i=>{const existing=mine.get(i.id);return `<article class="card"><h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}${i.deadline?' • Due '+formatDate(i.deadline):''}</p>${existing?`<p class="notice">Offer sent ✓ $${existing.amount} • ${esc(existing.status)}</p>`:`<form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" min="0" step="0.01" required placeholder="Your offer"><input name="message" maxlength="500" placeholder="Message / terms"><button>Send offer</button></div></form>`}</article>`}).join('');
-  const myOffers=(offers||[]).map(o=>{const i=o.intents;return `<article class="card"><span class="pill">${esc(o.status)}</span><h3>${esc(i?.description||'WANT')}</h3><p>${esc(i?.location||'Location flexible')}${i?.deadline?' • Due '+formatDate(i.deadline):''}</p><p><b>Your offer: $${o.amount}</b>${o.message?' • '+esc(o.message):''}</p>${o.status==='accepted'?'<p class="notice">Matched ✓ Your offer was accepted.</p>':''}</article>`}).join('');
+  const myOffers=(offers||[]).map(o=>{const i=o.intents;return `<article class="card"><span class="pill">${esc(o.status)}</span><h3>${esc(i?.description||'WANT')}</h3><p>${esc(i?.location||'Location flexible')}${i?.deadline?' • Due '+formatDate(i.deadline):''}</p><p><b>Your offer: $${o.amount}</b>${o.message?' • '+esc(o.message):''}</p>${o.status==='accepted'?`<div class="match-box"><b>Matched ✓ Your offer was accepted.</b><p>You and the buyer are now connected for this WANT.</p><p class="match-note">Contact sharing is the next secure step. Do not post private contact details in the public WANT.</p></div>`:''}</article>`}).join('');
   shell(`<section><p class="eyebrow">PROVIDER DASHBOARD</p><h2>Open WANTs</h2>${market||'<div class="empty">No open WANTs right now.</div>'}<div class="head provider-offers-head"><div><p class="eyebrow">YOUR ACTIVITY</p><h2>My Offers</h2></div></div>${myOffers||'<div class="empty">You have not sent any offers yet.</div>'}</section>`);
 }
 
@@ -146,5 +146,6 @@ window.acceptOffer=async(oid,iid)=>{
 
 function formatDate(d){return new Date(d+'T00:00:00').toLocaleDateString();}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
+function escAttr(s=''){return esc(s).replace(/`/g,'&#096;');}
 
 boot();
