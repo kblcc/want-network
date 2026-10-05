@@ -49,9 +49,10 @@ async function postIntent(e){
   if(!session)return auth('Sign in to publish your WANT.');
   if(profile?.role!=='buyer')return alert('Provider accounts cannot publish buyer intents in v1.');
   const f=new FormData(e.target),description=e.target.querySelector('textarea').value;
-  const {error}=await supabase.from('intents').insert({buyer_id:session.user.id,description,budget_max:f.get('budget')||null,location:f.get('location'),deadline:f.get('deadline')||null});
-  if(error)return alert(error.message);
-  dashboard();
+  const btn=e.target.querySelector('button[type="submit"],button:not([type])'); if(btn){btn.disabled=true;btn.textContent='Publishing…';}
+  const {error}=await supabase.from('intents').insert({buyer_id:session.user.id,description:description.trim(),budget_max:f.get('budget')||null,location:(f.get('location')||'').trim(),deadline:f.get('deadline')||null});
+  if(error){if(btn){btn.disabled=false;btn.textContent='Create my WANT →';}return alert(error.message);}
+  await dashboard();
 }
 
 function auth(msg=''){
@@ -109,7 +110,71 @@ async function dashboard(){
   if(profile?.role==='provider')return providerDash();
   const {data:intents,error}=await supabase.from('intents').select('*,offers!offers_intent_id_fkey(*)').eq('buyer_id',session.user.id).order('created_at',{ascending:false});
   if(error){console.error('Dashboard load:',error);return shell(`<section class="card"><h2>Could not load your WANTs</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
-  shell(`<section><div class="head"><div><p class="eyebrow">BUYER DASHBOARD</p><h2>My WANTs</h2></div><button type="button" class="primary" data-go="home">+ New WANT</button></div>${(intents||[]).map(i=>`<article class="card"><span class="pill">${i.status}</span><h3>${esc(i.description)}</h3><p>${i.location||'Location flexible'} • ${i.budget_max?'≤ $'+i.budget_max:'Budget open'}</p><h4>${i.offers.length} offer(s)</h4>${i.offers.map(o=>`<div class="offer"><div><b>$${o.amount}</b> ${esc(o.message||'')}</div>${i.status==='open'?`<button onclick="acceptOffer('${o.id}','${i.id}')">Accept</button>`:''}</div>`).join('')}</article>`).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
+  shell(`<section><div class="head"><div><p class="eyebrow">BUYER DASHBOARD</p><h2>My WANTs</h2></div><button type="button" class="primary" data-go="home">+ New WANT</button></div>${(intents||[]).map(i=>`<article class="card"><span class="pill">${i.status}</span><h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'≤ ${i.offers.length} offer(s)</h4>${i.offers.map(o=>`<div class="offer"><div><b>$${o.amount}</b> ${esc(o.message||'')}</div>${i.status==='open'?`<button onclick="acceptOffer('${o.id}','${i.id}')">Accept</button>`:''}</div>`).join('')}</article>`).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
+}
+
+async function providerDash(){
+  const {data:intents,error}=await supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false});
+  if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load open WANTs</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
+  shell(`<section><p class="eyebrow">PROVIDER MARKET</p><h2>Open WANTs</h2>${(intents||[]).map(i=>`<article class="card"><h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'Budget ≤  onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" step=".01" required placeholder="Your offer"><input name="message" placeholder="Message / terms"><button>Send offer</button></div></form></article>`).join('')||'<div class="empty">No open WANTs right now.</div>'}</section>`);
+}
+
+window.makeOffer=async(e,id)=>{
+  e.preventDefault();
+  if(!session||profile?.role!=='provider')return alert('Sign in with a provider account to send an offer.');
+  const f=new FormData(e.target),amount=f.get('amount'),message=(f.get('message')||'').trim();
+  const btn=e.target.querySelector('button'); btn.disabled=true; btn.textContent='Sending…';
+  const {error}=await supabase.from('offers').insert({intent_id:id,provider_id:session.user.id,amount,message});
+  if(error){btn.disabled=false;btn.textContent='Send offer';return alert(error.message);}
+  alert('Offer sent successfully.');
+  providerDash();
+};
+window.acceptOffer=async(oid,iid)=>{
+  const {error}=await supabase.rpc('accept_offer',{p_offer_id:oid,p_intent_id:iid});
+  if(error)alert(error.message);else dashboard();
+};
+function esc(s=''){return s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+
+boot();
++i.budget_max:'Budget open'}${i.deadline?' • Due '+new Date(i.deadline+'T00:00:00').toLocaleDateString():''}</p><h4>${i.offers.length} offer(s)</h4>${i.offers.map(o=>`<div class="offer"><div><b>$${o.amount}</b> ${esc(o.message||'')}</div>${i.status==='open'?`<button onclick="acceptOffer('${o.id}','${i.id}')">Accept</button>`:''}</div>`).join('')}</article>`).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
+}
+
+async function providerDash(){
+  const {data:intents,error}=await supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false});
+  if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load open WANTs</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
+  shell(`<section><p class="eyebrow">PROVIDER MARKET</p><h2>Open WANTs</h2>${(intents||[]).map(i=>`<article class="card"><h3>${esc(i.description)}</h3><p>${i.location||'Location flexible'} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}</p><form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" step=".01" required placeholder="Your offer"><input name="message" placeholder="Message / terms"><button>Send offer</button></div></form></article>`).join('')||'<div class="empty">No open WANTs right now.</div>'}</section>`);
+}
+
+window.makeOffer=async(e,id)=>{
+  e.preventDefault();
+  const f=new FormData(e.target);
+  const {error}=await supabase.from('offers').insert({intent_id:id,provider_id:session.user.id,amount:f.get('amount'),message:f.get('message')});
+  if(error)alert(error.message);else providerDash();
+};
+window.acceptOffer=async(oid,iid)=>{
+  const {error}=await supabase.rpc('accept_offer',{p_offer_id:oid,p_intent_id:iid});
+  if(error)alert(error.message);else dashboard();
+};
+function esc(s=''){return s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+
+boot();
++i.budget_max:'Budget open'}${i.deadline?' • Due '+new Date(i.deadline+'T00:00:00').toLocaleDateString():''}</p><form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" step=".01" required placeholder="Your offer"><input name="message" placeholder="Message / terms"><button>Send offer</button></div></form></article>`).join('')||'<div class="empty">No open WANTs right now.</div>'}</section>`);
+}
+
+window.makeOffer=async(e,id)=>{
+  e.preventDefault();
+  const f=new FormData(e.target);
+  const {error}=await supabase.from('offers').insert({intent_id:id,provider_id:session.user.id,amount:f.get('amount'),message:f.get('message')});
+  if(error)alert(error.message);else providerDash();
+};
+window.acceptOffer=async(oid,iid)=>{
+  const {error}=await supabase.rpc('accept_offer',{p_offer_id:oid,p_intent_id:iid});
+  if(error)alert(error.message);else dashboard();
+};
+function esc(s=''){return s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+
+boot();
++i.budget_max:'Budget open'}${i.deadline?' • Due '+new Date(i.deadline+'T00:00:00').toLocaleDateString():''}</p><h4>${i.offers.length} offer(s)</h4>${i.offers.map(o=>`<div class="offer"><div><b>$${o.amount}</b> ${esc(o.message||'')}</div>${i.status==='open'?`<button onclick="acceptOffer('${o.id}','${i.id}')">Accept</button>`:''}</div>`).join('')}</article>`).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
 }
 
 async function providerDash(){
