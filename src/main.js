@@ -116,7 +116,7 @@ async function dashboard(){
 async function providerDash(){
   const [{data:intents,error:intentError},{data:offers,error:offerError}]=await Promise.all([
     supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false}),
-    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents(id,description,location,budget_max,deadline,status)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
+    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents!offers_intent_id_fkey(id,description,location,budget_max,deadline,status)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
   ]);
   const error=intentError||offerError;
   if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load provider dashboard</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
