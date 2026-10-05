@@ -55,7 +55,14 @@ async function postIntent(e){
 }
 
 function auth(msg=''){
-  shell(`<section class="card narrow"><h2>Join WANT</h2>${msg?`<p class="notice">${msg}</p>`:''}<input id="email" type="email" placeholder="Email"><input id="password" type="password" placeholder="Password"><input id="name" placeholder="Display name"><select id="role"><option value="buyer">I want things</option><option value="provider">I provide things</option></select><div class="row"><button type="button" id="signup" class="primary">Create account</button><button type="button" id="signin">Sign in</button></div>${configured?'':'<p class="notice">Backend not connected yet. Add Supabase environment variables to activate accounts.</p>'}</section>`);
+  if(session){
+    const name=profile?.display_name||session.user.user_metadata?.display_name||'WANT member';
+    const role=(profile?.role||session.user.user_metadata?.role||'buyer')==='provider'?'Provider':'Buyer';
+    shell(`<section class="card narrow account-card"><p class="eyebrow">MY ACCOUNT</p><h2>${esc(name)}</h2><div class="account-row"><span>Account type</span><b>${role}</b></div><div class="account-row"><span>Email</span><b>${esc(session.user.email||'')}</b></div><div class="row"><button type="button" class="primary" data-go="dashboard">Go to Dashboard</button><button type="button" id="signout">Sign out</button></div></section>`);
+    $('#signout').onclick=signout;
+    return;
+  }
+  shell(`<section class="card narrow"><p class="eyebrow">WELCOME TO WANT</p><h2>Join WANT</h2>${msg?`<p class="notice">${esc(msg)}</p>`:''}<input id="email" type="email" autocomplete="email" placeholder="Email"><input id="password" type="password" autocomplete="current-password" placeholder="Password"><input id="name" autocomplete="name" placeholder="Display name"><select id="role"><option value="buyer">I want things</option><option value="provider">I provide things</option></select><div class="row"><button type="button" id="signup" class="primary">Create account</button><button type="button" id="signin">Sign in</button></div>${configured?'':'<p class="notice">Backend not connected yet. Add Supabase environment variables to activate accounts.</p>'}</section>`);
   $('#signup').onclick=signup;
   $('#signin').onclick=signin;
 }
@@ -75,6 +82,13 @@ async function signup(){
   if(error)return alert(error.message);
   if(data.session){session=data.session;await loadProfile();return dashboard();}
   alert('Account created. Please confirm your email, then come back here and sign in.');
+}
+
+async function signout(){
+  if(!configured)return;
+  const {error}=await supabase.auth.signOut();
+  if(error)return alert(error.message);
+  session=null; profile=null; auth('You have been signed out.');
 }
 
 async function signin(){
@@ -99,7 +113,8 @@ async function dashboard(){
 }
 
 async function providerDash(){
-  const {data:intents}=await supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false});
+  const {data:intents,error}=await supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false});
+  if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load open WANTs</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
   shell(`<section><p class="eyebrow">PROVIDER MARKET</p><h2>Open WANTs</h2>${(intents||[]).map(i=>`<article class="card"><h3>${esc(i.description)}</h3><p>${i.location||'Location flexible'} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}</p><form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" step=".01" required placeholder="Your offer"><input name="message" placeholder="Message / terms"><button>Send offer</button></div></form></article>`).join('')||'<div class="empty">No open WANTs right now.</div>'}</section>`);
 }
 
