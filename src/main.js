@@ -25,8 +25,9 @@ async function boot(){
       const r=await supabase.from('profiles').select('*').eq('id',session.user.id).maybeSingle();
       profile=r.data;
     }
-    supabase.auth.onAuthStateChange((_event,newSession)=>{
-      if(newSession?.user?.id!==session?.user?.id) location.reload();
+    supabase.auth.onAuthStateChange((event,newSession)=>{
+      session=newSession;
+      if(event==='SIGNED_OUT'){ profile=null; route('home'); }
     });
   }
   route('home');
@@ -59,18 +60,34 @@ function auth(msg=''){
   $('#signin').onclick=signin;
 }
 
+async function loadProfile(){
+  if(!session){profile=null;return;}
+  const {data,error}=await supabase.from('profiles').select('*').eq('id',session.user.id).maybeSingle();
+  if(error)console.warn('Profile load:',error.message);
+  profile=data || {id:session.user.id,display_name:session.user.user_metadata?.display_name||'',role:session.user.user_metadata?.role||'buyer'};
+}
+
 async function signup(){
   if(!configured)return alert('Connect Supabase first.');
-  const email=$('#email').value,password=$('#password').value,display_name=$('#name').value,role=$('#role').value;
-  const {error}=await supabase.auth.signUp({email,password,options:{data:{display_name,role}}});
+  const email=$('#email').value.trim(),password=$('#password').value,display_name=$('#name').value.trim(),role=$('#role').value;
+  if(!email||!password)return alert('Enter your email and password.');
+  const {data,error}=await supabase.auth.signUp({email,password,options:{data:{display_name,role},emailRedirectTo:window.location.origin}});
   if(error)return alert(error.message);
-  alert('Account created. Check your email if confirmation is enabled.');
+  if(data.session){session=data.session;await loadProfile();return dashboard();}
+  alert('Account created. Please confirm your email, then come back here and sign in.');
 }
 
 async function signin(){
   if(!configured)return alert('Connect Supabase first.');
-  const {error}=await supabase.auth.signInWithPassword({email:$('#email').value,password:$('#password').value});
-  if(error)alert(error.message);
+  const email=$('#email').value.trim(),password=$('#password').value;
+  if(!email||!password)return alert('Enter your email and password.');
+  const btn=$('#signin'); btn.disabled=true; btn.textContent='Signing in…';
+  const {data,error}=await supabase.auth.signInWithPassword({email,password});
+  if(error){btn.disabled=false;btn.textContent='Sign in';return alert(error.message);}
+  session=data.session;
+  if(!session){btn.disabled=false;btn.textContent='Sign in';return alert('Sign in did not create a session. Please confirm your email first.');}
+  await loadProfile();
+  dashboard();
 }
 
 async function dashboard(){
