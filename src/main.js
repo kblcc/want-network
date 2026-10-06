@@ -2,11 +2,47 @@ import './style.css';
 import {supabase,configured} from './supabase.js';
 
 const $=s=>document.querySelector(s);
-let session=null, profile=null, activeChannel=null;
+let session=null, profile=null, activeChannel=null, notifChannel=null, unread=0;
 const app=$('#app');
 
+function bell(){
+  if(!session)return '';
+  const label=unread?`Notifications, ${unread} unread`:'Notifications';
+  return `<button type="button" class="bell" data-go="notifications" aria-label="${label}" title="${label}"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5.5-6.84V3.5a1.5 1.5 0 0 0-3 0v.66A7 7 0 0 0 5 11v5l-2 2v1h18v-1l-2-2Z"/></svg>${unread?`<span class="badge">${unread>9?'9+':unread}</span>`:''}</button>`;
+}
+
+function renderBell(){
+  const old=document.querySelector('nav .bell');
+  if(old)old.outerHTML=bell();
+}
+
 function shell(body){
-  app.innerHTML=`<nav><b>WANT<span>.</span></b><div><button type="button" data-go="home">Home</button><button type="button" data-go="dashboard">Dashboard</button><button type="button" data-go="auth">Account</button></div></nav><main>${body}</main><footer>WANT • The market comes to you</footer>`;
+  app.innerHTML=`<nav><b>WANT<span>.</span></b><div><button type="button" data-go="home">Home</button><button type="button" data-go="dashboard">Dashboard</button><button type="button" data-go="auth">Account</button>${bell()}</div></nav><main>${body}</main><footer>WANT • The market comes to you</footer>`;
+}
+
+async function refreshUnread(){
+  if(!session){unread=0;return renderBell();}
+  const {count,error}=await supabase.from('notifications').select('id',{count:'exact',head:true}).eq('user_id',session.user.id).is('read_at',null);
+  if(error)return console.warn('Notifications count:',error.message);
+  unread=count||0;
+  renderBell();
+}
+
+function startNotifications(){
+  stopNotifications();
+  if(!session)return;
+  refreshUnread();
+  notifChannel=supabase.channel('notifications-'+session.user.id)
+    .on('postgres_changes',{event:'*',schema:'public',table:'notifications',filter:'user_id=eq.'+session.user.id},()=>{
+      refreshUnread();
+      if(document.querySelector('.notif-list'))notifications();
+    })
+    .subscribe();
+}
+
+function stopNotifications(){
+  if(notifChannel){supabase.removeChannel(notifChannel);notifChannel=null;}
+  unread=0;
 }
 
 document.addEventListener('click',e=>{
@@ -21,6 +57,7 @@ async function loadProfile(){
   const {data,error}=await supabase.from('profiles').select('*').eq('id',session.user.id).maybeSingle();
   if(error)console.warn('Profile load:',error.message);
   profile=data||{id:session.user.id,display_name:session.user.user_metadata?.display_name||'',role:session.user.user_metadata?.role||'buyer'};
+  startNotifications();
 }
 
 async function boot(){
@@ -31,7 +68,7 @@ async function boot(){
     if(session)await loadProfile();
     supabase.auth.onAuthStateChange((event,newSession)=>{
       session=newSession;
-      if(event==='SIGNED_OUT'){profile=null;route('home');}
+      if(event==='SIGNED_OUT'){profile=null;stopNotifications();route('home');}
     });
   }
   route('home');
@@ -40,6 +77,7 @@ async function boot(){
 function route(r,id){
   if(activeChannel){supabase.removeChannel(activeChannel);activeChannel=null;}
   if(r==='chat')return chat(id);
+  if(r==='notifications')return notifications();
   if(r==='auth')return auth();
   if(r==='dashboard')return dashboard();
   return home();
@@ -91,7 +129,7 @@ async function signout(){
   if(!configured)return;
   const {error}=await supabase.auth.signOut();
   if(error)return alert(error.message);
-  session=null;profile=null;auth('You have been signed out.');
+  session=null;profile=null;stopNotifications();auth('You have been signed out.');
 }
 
 async function signin(){
@@ -183,6 +221,45 @@ async function chat(intentId){
     add(data);
     box.focus();
   };
+}
+
+const NOTIF_ICON={new_offer:'💬',offer_accepted:'✅',offer_declined:'•',new_message:'✉️'};
+
+async function notifications(){
+  if(!session)return auth('Sign in to see your notifications.');
+  const {data,error}=await supabase.from('notifications').select('id,kind,body,intent_id,read_at,created_at').eq('user_id',session.user.id).order('created_at',{ascending:false}).limit(50);
+  if(error)return shell(`<section class="card narrow"><h2>Could not load notifications</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="notifications">Try again</button></section>`);
+  const items=(data||[]).map(n=>`<li><button type="button" class="notif${n.read_at?'':' unread'}" data-notif="${escAttr(n.id)}" data-kind="${escAttr(n.kind)}" data-intent="${escAttr(n.intent_id||'')}"><span class="notif-icon" aria-hidden="true">${NOTIF_ICON[n.kind]||'•'}</span><span class="notif-text"><span class="notif-body">${esc(n.body)}</span><time datetime="${escAttr(n.created_at)}">${esc(timeAgo(n.created_at))}</time></span>${n.read_at?'':'<span class="dot" aria-label="Unread"></span>'}</button></li>`).join('');
+  shell(`<section class="notif-page"><div class="head"><div><p class="eyebrow">ACTIVITY</p><h2>Notifications</h2></div>${(data||[]).some(n=>!n.read_at)?'<button type="button" id="markAll">Mark all as read</button>':''}</div><div class="card notif-card">${items?`<ul class="notif-list">${items}</ul>`:'<div class="empty">No notifications yet. You\'ll see new offers, accepted offers and messages here.</div>'}</div></section>`);
+  $('#markAll')?.addEventListener('click',async e=>{
+    e.target.disabled=true;
+    const {error}=await supabase.from('notifications').update({read_at:new Date().toISOString()}).eq('user_id',session.user.id).is('read_at',null);
+    if(error){e.target.disabled=false;return alert(error.message);}
+    await refreshUnread();
+    notifications();
+  });
+}
+
+document.addEventListener('click',async e=>{
+  const n=e.target.closest('[data-notif]');
+  if(!n)return;
+  if(n.classList.contains('unread')){
+    n.classList.remove('unread');
+    await supabase.from('notifications').update({read_at:new Date().toISOString()}).eq('id',n.dataset.notif).is('read_at',null);
+    refreshUnread();
+  }
+  const intent=n.dataset.intent,kind=n.dataset.kind;
+  if(intent&&(kind==='new_message'||kind==='offer_accepted'))return route('chat',intent);
+  route('dashboard');
+});
+
+function timeAgo(ts){
+  const s=Math.max(0,(Date.now()-new Date(ts).getTime())/1000);
+  if(s<60)return 'Just now';
+  if(s<3600)return Math.floor(s/60)+' min ago';
+  if(s<86400)return Math.floor(s/3600)+' h ago';
+  if(s<604800)return Math.floor(s/86400)+' d ago';
+  return new Date(ts).toLocaleDateString();
 }
 
 window.makeOffer=async(e,id)=>{
