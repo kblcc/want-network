@@ -18,10 +18,11 @@ alter default privileges in schema public grant all on tables to anon, authentic
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create publication supabase_realtime;
 `);
-for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql']) {
+for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql']) {
   await db.exec(fs.readFileSync(R+f,'utf8')); console.log('applied', f);
 }
-await db.exec(fs.readFileSync(R+'migrations/004_messaging.sql','utf8')); console.log('004 re-run OK (idempotent)');
+for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
+console.log('004-006 re-run in order OK (idempotent)');
 const U={buyer:'00000000-0000-0000-0000-00000000000b',winner:'00000000-0000-0000-0000-00000000000a',loser:'00000000-0000-0000-0000-00000000000c',stranger:'00000000-0000-0000-0000-00000000000d'};
 await db.exec(`create role auth_admin nologin; grant usage on schema auth to auth_admin; grant insert on auth.users to auth_admin; set role auth_admin;`);
 await db.exec(`insert into auth.users values
@@ -82,4 +83,31 @@ await as('buyer',`select accept_offer('${W2}','${I2}')`);
 await as('winner',`insert into messages(intent_id,body) values('${I2}','On my way')`);
 ok((await as('buyer',`select * from messages where intent_id='${I2}'`)).rows.length===1,'post-005: post → offer → accept → message flow works');
 ok((await as('buyer',`select * from notifications where kind='new_message'`)).rows.length===2,'post-005: message notification trigger still fires');
+
+// 006 notifications
+const cnt=async(u,w)=>(await as(u,`select count(*)::int n from notifications where ${w}`)).rows[0].n;
+const I3=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Paint fence') returning id`)).rows[0].id;
+const W3=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${I3}','${U.winner}',150) returning id`)).rows[0].id;
+await as('loser',`insert into offers(intent_id,provider_id,amount) values('${I3}','${U.loser}',140.5)`);
+ok(await cnt('buyer',`kind='new_offer' and intent_id='${I3}'`)===2,'buyer notified of each new offer (linked to WANT)');
+ok((await as('buyer',`select body from notifications where kind='new_offer' and body like '%140.50%'`)).rows.length===1,'offer notification shows amount');
+await as('buyer',`select accept_offer('${W3}','${I3}')`);
+ok(await cnt('winner',`kind='offer_accepted' and intent_id='${I3}'`)===1,'accepted provider notified (linked)');
+ok(await cnt('loser',`kind='offer_declined' and intent_id='${I3}'`)===1,'losing provider notified of decline');
+ok(await cnt('winner',`kind='offer_declined'`)===0,'winner not told they were declined');
+for(let k=0;k<3;k++) await as('winner',`insert into messages(intent_id,body) values('${I3}','msg ${k}')`);
+ok(await cnt('buyer',`kind='new_message' and intent_id='${I3}' and read_at is null`)===1,'3 messages -> 1 unread message notification');
+const mr=await as('buyer',`update notifications set read_at=now() where intent_id='${I3}' and read_at is null returning id`);
+ok(mr.rows.length===3,'user can mark own notifications read');
+await as('winner',`insert into messages(intent_id,body) values('${I3}','after read')`);
+ok(await cnt('buyer',`kind='new_message' and intent_id='${I3}' and read_at is null`)===1,'new message after reading creates fresh unread');
+const other=await as('loser',`update notifications set read_at=now() where user_id='${U.buyer}' returning id`);
+ok(other.rows.length===0,'cannot mark someone else\'s notifications');
+ok(await cnt('loser',`user_id<>'${U.loser}'`)===0,'cannot read someone else\'s notifications');
+await expectErr('buyer',`update notifications set body='hacked' where user_id='${U.buyer}'`,'cannot change notification text');
+await expectErr('buyer',`update notifications set user_id='${U.loser}' where user_id='${U.buyer}'`,'cannot reassign a notification');
+await expectErr('buyer',`insert into notifications(user_id,kind,body) values('${U.buyer}','x','fake')`,'cannot create fake notifications');
+const dn=await as('buyer',`delete from notifications returning id`).catch(e=>({err:e})); ok(dn.err||dn.rows.length===0,'cannot delete notifications');
+const nf=await as('buyer',`select notify_new_offer()`).catch(e=>({err:e})); ok(!!nf.err,'new-offer trigger function not callable via API');
+ok((await db.query(`select 1 from pg_publication_tables where tablename='notifications'`)).rows.length===1,'notifications in realtime publication');
 console.log(`\n${pass} passed, ${fail} failed`);
