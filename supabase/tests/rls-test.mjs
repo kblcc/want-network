@@ -18,11 +18,11 @@ alter default privileges in schema public grant all on tables to anon, authentic
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create publication supabase_realtime;
 `);
-for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql']) {
+for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql']) {
   await db.exec(fs.readFileSync(R+f,'utf8')); console.log('applied', f);
 }
-for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
-console.log('004-007 re-run in order OK (idempotent)');
+for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
+console.log('004-008 re-run in order OK (idempotent)');
 const U={buyer:'00000000-0000-0000-0000-00000000000b',winner:'00000000-0000-0000-0000-00000000000a',loser:'00000000-0000-0000-0000-00000000000c',stranger:'00000000-0000-0000-0000-00000000000d'};
 await db.exec(`create role auth_admin nologin; grant usage on schema auth to auth_admin; grant insert on auth.users to auth_admin; set role auth_admin;`);
 await db.exec(`insert into auth.users values
@@ -165,4 +165,35 @@ ok(await st(D)==='completed','buyer can complete without provider step');
 for (const f of [`edit_intent('${D}','x',1,null,null)`,`cancel_intent('${D}')`,`mark_job_done('${D}')`,`confirm_completed('${D}')`]) {
   await db.exec(`reset role; set role anon;`); const r=await db.query(`select ${f}`).catch(e=>({err:e})); ok(!!r.err,'anon cannot call '+f.split('(')[0]);
 }
+
+// 008 start job
+const S=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Clean gutters') returning id`)).rows[0].id;
+const SO=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${S}','${U.winner}',90) returning id`)).rows[0].id;
+await as('loser',`insert into offers(intent_id,provider_id,amount) values('${S}','${U.loser}',85)`);
+await expectErr('winner',`select start_job('${S}')`,'cannot start before match');
+await as('buyer',`select accept_offer('${SO}','${S}')`);
+await expectErr('buyer',`select start_job('${S}')`,'buyer cannot start job');
+await expectErr('loser',`select start_job('${S}')`,'losing provider cannot start job');
+await expectErr('stranger',`select start_job('${S}')`,'stranger cannot start job');
+await as('winner',`select start_job('${S}')`);
+const sr=(await db.query(`select status,started_at,provider_done_at from intents where id='${S}'`)).rows[0];
+ok(sr.status==='matched'&&sr.started_at&&!sr.provider_done_at,'provider starts job (status stays matched, started_at set)');
+ok(await cnt('buyer',`kind='job_started' and intent_id='${S}'`)===1,'buyer notified job started');
+await expectErr('winner',`select start_job('${S}')`,'cannot start twice');
+await as('winner',`insert into messages(intent_id,body) values('${S}','On my way')`); ok(true,'messaging still works while in progress');
+await as('winner',`select mark_job_done('${S}')`);
+await as('buyer',`select confirm_completed('${S}')`);
+ok(await st(S)==='completed','start -> done -> confirm completes');
+await expectErr('winner',`select start_job('${S}')`,'cannot start completed job');
+// backward compat: done without start records started_at
+const K=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Fix door') returning id`)).rows[0].id;
+const KO=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${K}','${U.winner}',40) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${KO}','${K}')`); await as('winner',`select mark_job_done('${K}')`);
+ok((await db.query(`select started_at is not null s from intents where id='${K}'`)).rows[0].s,'mark done without start also sets started_at');
+// cancel while in progress
+const Q=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Tile floor') returning id`)).rows[0].id;
+const QO=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${Q}','${U.winner}',300) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${QO}','${Q}')`); await as('winner',`select start_job('${Q}')`); await as('buyer',`select cancel_intent('${Q}')`);
+ok(await st(Q)==='cancelled','buyer can cancel an in-progress job');
+await db.exec(`reset role; set role anon;`); const an8=await db.query(`select start_job('${Q}')`).catch(e=>({err:e})); ok(!!an8.err,'anon cannot call start_job');
 console.log(`\n${pass} passed, ${fail} failed`);
