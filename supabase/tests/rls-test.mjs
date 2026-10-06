@@ -18,11 +18,11 @@ alter default privileges in schema public grant all on tables to anon, authentic
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create publication supabase_realtime;
 `);
-for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql']) {
+for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql']) {
   await db.exec(fs.readFileSync(R+f,'utf8')); console.log('applied', f);
 }
-for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
-console.log('004-006 re-run in order OK (idempotent)');
+for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
+console.log('004-007 re-run in order OK (idempotent)');
 const U={buyer:'00000000-0000-0000-0000-00000000000b',winner:'00000000-0000-0000-0000-00000000000a',loser:'00000000-0000-0000-0000-00000000000c',stranger:'00000000-0000-0000-0000-00000000000d'};
 await db.exec(`create role auth_admin nologin; grant usage on schema auth to auth_admin; grant insert on auth.users to auth_admin; set role auth_admin;`);
 await db.exec(`insert into auth.users values
@@ -110,4 +110,59 @@ await expectErr('buyer',`insert into notifications(user_id,kind,body) values('${
 const dn=await as('buyer',`delete from notifications returning id`).catch(e=>({err:e})); ok(dn.err||dn.rows.length===0,'cannot delete notifications');
 const nf=await as('buyer',`select notify_new_offer()`).catch(e=>({err:e})); ok(!!nf.err,'new-offer trigger function not callable via API');
 ok((await db.query(`select 1 from pg_publication_tables where tablename='notifications'`)).rows.length===1,'notifications in realtime publication');
+
+// 007 lifecycle
+const st=async id=>(await db.query(`select status from intents where id='${id}'`)).rows[0].status;
+const E=(await as('buyer',`insert into intents(buyer_id,description,budget_max) values('${U.buyer}','Mow lawn',50) returning id`)).rows[0].id;
+await as('loser',`insert into offers(intent_id,provider_id,amount) values('${E}','${U.loser}',45)`);
+await as('buyer',`select edit_intent('${E}','Mow lawn and trim hedges',80,'Aurora',null)`);
+ok((await as('buyer',`select description,budget_max::int b from intents where id='${E}'`)).rows[0].b===80,'buyer can edit open WANT');
+ok(await cnt('loser',`kind='want_edited' and intent_id='${E}'`)===1,'offering provider notified of edit');
+await expectErr('stranger',`select edit_intent('${E}','hijack',1,null,null)`,'other user cannot edit');
+await expectErr('loser',`select edit_intent('${E}','hijack',1,null,null)`,'provider cannot edit');
+await expectErr('buyer',`select edit_intent('${E}','   ',1,null,null)`,'blank description rejected');
+await expectErr('buyer',`select edit_intent('${E}','ok',-5,null,null)`,'negative budget rejected');
+await expectErr('buyer',`select edit_intent('${E}','ok',1,null,current_date-1)`,'past deadline rejected');
+await expectErr('buyer',`update intents set status='completed' where id='${E}'`,'no direct status update');
+await expectErr('stranger',`select cancel_intent('${E}')`,'other user cannot cancel');
+await as('buyer',`select cancel_intent('${E}')`);
+ok(await st(E)==='cancelled','buyer can cancel open WANT');
+ok((await as('loser',`select status from offers where intent_id='${E}'`)).rows[0].status==='declined','pending offers declined on cancel');
+ok(await cnt('loser',`kind='want_cancelled' and intent_id='${E}'`)===1,'provider notified of cancel');
+ok((await as('loser',`select id from intents where id='${E}'`)).rows.length===1,'provider can still see cancelled WANT in My Offers');
+await expectErr('buyer',`select edit_intent('${E}','late',1,null,null)`,'cannot edit cancelled WANT');
+await expectErr('winner',`insert into offers(intent_id,provider_id,amount) values('${E}','${U.winner}',40)`,'no offers on cancelled WANT');
+// completion
+const C=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Assemble desk') returning id`)).rows[0].id;
+const CO=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${C}','${U.winner}',60) returning id`)).rows[0].id;
+await as('loser',`insert into offers(intent_id,provider_id,amount) values('${C}','${U.loser}',55)`);
+await expectErr('winner',`select mark_job_done('${C}')`,'cannot mark done before match');
+await as('buyer',`select accept_offer('${CO}','${C}')`);
+await expectErr('buyer',`select edit_intent('${C}','x',1,null,null)`,'cannot edit matched WANT');
+await expectErr('loser',`select mark_job_done('${C}')`,'losing provider cannot mark done');
+await expectErr('buyer',`select mark_job_done('${C}')`,'buyer cannot use provider done');
+await as('winner',`select mark_job_done('${C}')`);
+ok(await cnt('buyer',`kind='job_done' and intent_id='${C}'`)===1,'buyer notified job done');
+await expectErr('winner',`select mark_job_done('${C}')`,'cannot mark done twice');
+await expectErr('winner',`select confirm_completed('${C}')`,'provider cannot confirm completion');
+await as('buyer',`select confirm_completed('${C}')`);
+ok(await st(C)==='completed','buyer confirms -> completed');
+ok(await cnt('winner',`kind='job_completed' and intent_id='${C}'`)===1,'provider notified completed');
+await expectErr('buyer',`select cancel_intent('${C}')`,'cannot cancel completed job');
+await expectErr('buyer',`insert into messages(intent_id,body) values('${C}','after')`,'chat read-only after completion');
+ok((await as('winner',`select id from messages where intent_id='${C}'`)).rows!==undefined && (await as('winner',`select id from intents where id='${C}'`)).rows.length===1,'provider still sees completed WANT');
+// cancel a matched job
+const M=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Walk dog') returning id`)).rows[0].id;
+const MO=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${M}','${U.winner}',20) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${MO}','${M}')`);
+await as('buyer',`select cancel_intent('${M}')`);
+ok(await st(M)==='cancelled'&&await cnt('winner',`kind='want_cancelled' and intent_id='${M}'`)===1,'buyer can cancel matched job; provider notified');
+// direct confirm without provider done
+const D=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Hang shelf') returning id`)).rows[0].id;
+const DO=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${D}','${U.winner}',30) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${DO}','${D}')`); await as('buyer',`select confirm_completed('${D}')`);
+ok(await st(D)==='completed','buyer can complete without provider step');
+for (const f of [`edit_intent('${D}','x',1,null,null)`,`cancel_intent('${D}')`,`mark_job_done('${D}')`,`confirm_completed('${D}')`]) {
+  await db.exec(`reset role; set role anon;`); const r=await db.query(`select ${f}`).catch(e=>({err:e})); ok(!!r.err,'anon cannot call '+f.split('(')[0]);
+}
 console.log(`\n${pass} passed, ${fail} failed`);
