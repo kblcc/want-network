@@ -154,8 +154,10 @@ async function dashboard(){
   shell(`<section><div class="head"><div><p class="eyebrow">BUYER DASHBOARD</p><h2>My WANTs</h2></div><button type="button" class="primary" data-go="home">+ New WANT</button></div>${(intents||[]).map(buyerCard).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
 }
 
-const STATUS_LABEL={open:'Open',matched:'In progress',completed:'Completed',cancelled:'Cancelled',closed:'Closed',pending:'Pending',accepted:'Accepted',declined:'Declined',withdrawn:'Withdrawn'};
+const STATUS_LABEL={open:'Open',matched:'Matched',in_progress:'In progress',awaiting:'Awaiting confirmation',completed:'Completed',cancelled:'Cancelled',closed:'Closed',pending:'Pending',accepted:'Accepted',declined:'Declined',withdrawn:'Withdrawn'};
 function pill(st){return `<span class="pill st-${escAttr(st)}">${esc(STATUS_LABEL[st]||st)}</span>`;}
+function stage(i){if(i.status!=='matched')return i.status;if(i.provider_done_at)return 'awaiting';if(i.started_at)return 'in_progress';return 'matched';}
+const fmtDay=ts=>ts?esc(new Date(ts).toLocaleDateString()):'';
 function wantMeta(i){return `${esc(i.location||'Location flexible')} • ${i.budget_max!=null?'≤ $'+esc(i.budget_max):'Budget open'}${i.deadline?' • Due '+formatDate(i.deadline):''}`;}
 
 function buyerCard(i){
@@ -164,7 +166,11 @@ function buyerCard(i){
   if(i.status==='open'){
     actions=`<div class="actions"><button type="button" data-go="edit" data-id="${id}">Edit</button><button type="button" class="ghost danger" onclick="cancelWant('${id}',false)">Cancel WANT</button></div>`;
   }else if(i.status==='matched'){
-    actions=`${i.provider_done_at?`<p class="notice">Your provider marked the job as done${' on '+esc(new Date(i.provider_done_at).toLocaleDateString())}. Please confirm once you're satisfied.</p>`:''}<div class="actions"><button type="button" class="primary" onclick="confirmCompleted('${id}')">${i.provider_done_at?'Confirm completed':'Mark as completed'}</button><button type="button" class="ghost danger" onclick="cancelWant('${id}',true)">Cancel job</button></div>`;
+    const st=stage(i);
+    const note=st==='awaiting'?`<p class="notice">Your provider marked the job as done on ${fmtDay(i.provider_done_at)}. Please confirm once you're satisfied.</p>`
+      :st==='in_progress'?`<p class="stage-note">Job in progress since ${fmtDay(i.started_at)}.</p>`
+      :`<p class="stage-note">Waiting for your provider to start the job. Use messages to agree on the details.</p>`;
+    actions=`${note}<div class="actions"><button type="button" class="${st==='matched'?'':'primary'}" onclick="confirmCompleted('${id}')">${st==='awaiting'?'Confirm completed':'Mark as completed'}</button><button type="button" class="ghost danger" onclick="cancelWant('${id}',true)">Cancel job</button></div>`;
   }else if(i.status==='completed'){
     actions=`<p class="done-note">Completed ✓${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}</p>`;
   }else if(i.status==='cancelled'){
@@ -172,21 +178,22 @@ function buyerCard(i){
   }
   const offers=i.offers||[];
   const offerRows=offers.map(o=>`<div class="offer"><div><b>$${esc(o.amount)}</b> ${esc(o.message||'')} ${pill(o.status)}</div>${i.status==='open'&&o.status==='pending'?`<button type="button" onclick="acceptOffer('${escAttr(o.id)}','${id}')">Accept</button>`:''}${o.status==='accepted'&&i.status!=='cancelled'?`<button type="button" class="${i.status==='matched'?'primary ':''}msg-btn" data-go="chat" data-id="${id}">${i.status==='matched'?'Message provider':'View conversation'}</button>`:''}</div>`).join('');
-  return `<article class="card${i.status==='cancelled'?' is-cancelled':''}">${pill(i.status)}<h3>${esc(i.description)}</h3><p>${wantMeta(i)}${i.updated_at&&i.status==='open'?' • Edited':''}</p>${actions}<h4>${offers.length} offer(s)</h4>${offerRows}</article>`;
+  return `<article class="card${i.status==='cancelled'?' is-cancelled':''}">${pill(stage(i))}<h3>${esc(i.description)}</h3><p>${wantMeta(i)}${i.updated_at&&i.status==='open'?' • Edited':''}</p>${actions}<h4>${offers.length} offer(s)</h4>${offerRows}</article>`;
 }
 
 function providerOfferCard(o){
   const i=o.intents||{}, id=escAttr(o.intent_id);
   let box='';
   if(o.status==='accepted'){
-    if(i.status==='matched'&&!i.provider_done_at)box=`<div class="match-box"><b>Matched ✓ Your offer was accepted.</b><p>Agree on the details with the buyer, do the job, then mark it as done.</p><div class="actions"><button type="button" class="primary" data-go="chat" data-id="${id}">Message buyer</button><button type="button" onclick="markJobDone('${id}')">Mark job as done</button></div></div>`;
+    if(stage(i)==='matched')box=`<div class="match-box"><b>Matched ✓ Your offer was accepted.</b><p>Agree on the details with the buyer, then start the job when you begin.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">Message buyer</button><button type="button" class="primary" onclick="startJob('${id}')">Start job</button></div></div>`;
+    else if(stage(i)==='in_progress')box=`<div class="match-box"><b>Job in progress</b><p>Started on ${fmtDay(i.started_at)}. Mark it as done when you've finished.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">Message buyer</button><button type="button" class="primary" onclick="markJobDone('${id}')">Mark job as done</button></div></div>`;
     else if(i.status==='matched')box=`<div class="match-box"><b>Job marked as done ✓</b><p>Waiting for the buyer to confirm it's completed.</p><button type="button" class="msg-btn" data-go="chat" data-id="${id}">Message buyer</button></div>`;
     else if(i.status==='completed')box=`<div class="match-box done"><b>Job completed ✓</b><p>The buyer confirmed this job${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}.</p><button type="button" class="msg-btn" data-go="chat" data-id="${id}">View conversation</button></div>`;
     else if(i.status==='cancelled')box=`<p class="muted-note">The buyer cancelled this job.</p>`;
   }else if(i.status==='cancelled'){
     box=`<p class="muted-note">The buyer cancelled this WANT.</p>`;
   }
-  const shown=o.status==='accepted'&&i.status&&i.status!=='matched'?i.status:o.status;
+  const shown=o.status==='accepted'&&i.status?stage(i):o.status;
   return `<article class="card">${pill(shown)}<h3>${esc(i.description||'WANT')}</h3><p>${esc(i.location||'Location flexible')}${i.deadline?' • Due '+formatDate(i.deadline):''}</p><p><b>Your offer: $${esc(o.amount)}</b>${o.message?' • '+esc(o.message):''}</p>${box}</article>`;
 }
 
@@ -221,6 +228,12 @@ window.confirmCompleted=async id=>{
   if(error)return alert(error.message);
   dashboard();
 };
+window.startJob=async id=>{
+  if(!confirm('Start this job now? The buyer will be notified.'))return;
+  const {error}=await supabase.rpc('start_job',{p_intent_id:id});
+  if(error)return alert(error.message);
+  dashboard();
+};
 window.markJobDone=async id=>{
   if(!confirm('Mark this job as done? The buyer will be asked to confirm.'))return;
   const {error}=await supabase.rpc('mark_job_done',{p_intent_id:id});
@@ -231,7 +244,7 @@ window.markJobDone=async id=>{
 async function providerDash(){
   const [{data:intents,error:intentError},{data:offers,error:offerError}]=await Promise.all([
     supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false}),
-    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents!offers_intent_id_fkey(id,buyer_id,description,location,budget_max,deadline,status,provider_done_at,completed_at,cancelled_at)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
+    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents!offers_intent_id_fkey(id,buyer_id,description,location,budget_max,deadline,status,started_at,provider_done_at,completed_at,cancelled_at)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
   ]);
   const error=intentError||offerError;
   if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load provider dashboard</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
@@ -298,7 +311,7 @@ async function chat(intentId){
   };
 }
 
-const NOTIF_ICON={new_offer:'💬',offer_accepted:'✅',offer_declined:'•',new_message:'✉️',want_edited:'✏️',want_cancelled:'✕',job_done:'🧹',job_completed:'🎉'};
+const NOTIF_ICON={new_offer:'💬',offer_accepted:'✅',offer_declined:'•',new_message:'✉️',want_edited:'✏️',want_cancelled:'✕',job_started:'▶️',job_done:'🧹',job_completed:'🎉'};
 
 async function notifications(){
   if(!session)return auth('Sign in to see your notifications.');
