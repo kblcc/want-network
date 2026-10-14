@@ -18,11 +18,11 @@ alter default privileges in schema public grant all on tables to anon, authentic
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create publication supabase_realtime;
 `);
-for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql']) {
+for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql']) {
   await db.exec(fs.readFileSync(R+f,'utf8')); console.log('applied', f);
 }
-for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
-console.log('004-009 re-run in order OK (idempotent)');
+for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
+console.log('004-010 re-run in order OK (idempotent)');
 const U={buyer:'00000000-0000-0000-0000-00000000000b',winner:'00000000-0000-0000-0000-00000000000a',loser:'00000000-0000-0000-0000-00000000000c',stranger:'00000000-0000-0000-0000-00000000000d'};
 await db.exec(`create role auth_admin nologin; grant usage on schema auth to auth_admin; grant insert on auth.users to auth_admin; set role auth_admin;`);
 await db.exec(`insert into auth.users values
@@ -235,4 +235,31 @@ await as('buyer',`select accept_offer('${M2O}','${M2}')`); await as('buyer',`sel
 await expectErr('buyer',`select submit_review('${M2}',1,'x')`,'cannot review a cancelled job');
 await db.exec(`reset role; set role anon;`);
 for (const q of [`select * from reviews`,`select * from user_ratings`,`select submit_review('${R1}',5,'x')`]) { const r=await db.query(q).catch(e=>({err:e})); ok(!!r.err,'anon blocked: '+q.split(' ').slice(0,4).join(' ')); }
+
+// 010 profiles
+await as('winner',`update profiles set display_name='Win Cleaners', bio='10 years experience', service_area='Denver metro', services=array['Home cleaning','Deep cleaning'] where id='${U.winner}'`);
+const wp=(await as('stranger',`select display_name,bio,service_area,services from profiles where id='${U.winner}'`)).rows[0];
+ok(wp.display_name==='Win Cleaners'&&wp.services.length===2,'provider edits own profile; other users can read it');
+const hijack=await as('loser',`update profiles set bio='hacked' where id='${U.winner}' returning id`).catch(e=>({err:e}));
+ok(hijack.err||hijack.rows.length===0,'cannot edit someone else\'s profile');
+await expectErr('winner',`update profiles set role='buyer' where id='${U.winner}'`,'cannot change own role');
+await expectErr('winner',`update profiles set id='${U.loser}' where id='${U.winner}'`,'cannot change profile id');
+await expectErr('winner',`update profiles set bio=repeat('x',601) where id='${U.winner}'`,'bio over 600 chars rejected');
+await expectErr('winner',`update profiles set display_name=repeat('x',81) where id='${U.winner}'`,'name over 80 chars rejected');
+await expectErr('winner',`update profiles set services=array['a','b','c','d','e','f','g','h','i','j','k'] where id='${U.winner}'`,'more than 10 services rejected');
+await expectErr('winner',`update profiles set services=array[repeat('x',41)] where id='${U.winner}'`,'service over 40 chars rejected');
+await expectErr('winner',`update profiles set services=array['  '] where id='${U.winner}'`,'blank service rejected');
+await expectErr('stranger',`insert into profiles(id,role) values(gen_random_uuid(),'provider')`,'cannot create profiles directly');
+const pdel=await as('winner',`delete from profiles where id='${U.winner}' returning id`).catch(e=>({err:e})); ok(pdel.err||pdel.rows.length===0,'cannot delete profiles');
+const gp=(await as('stranger',`select get_profile('${U.winner}') j`)).rows[0].j;
+ok(gp.display_name==='Win Cleaners'&&gp.role==='provider'&&gp.completed_jobs>=1&&gp.review_count>=1&&gp.avg_rating!==null,'get_profile returns stats (jobs '+gp.completed_jobs+', reviews '+gp.review_count+')');
+const gb=(await as('winner',`select get_profile('${U.buyer}') j`)).rows[0].j;
+ok(gb.role==='buyer'&&gb.completed_wants>=1,'get_profile counts buyer completed WANTs');
+ok(!('email' in gp),'get_profile does not expose email');
+ok((await as('winner',`select get_profile(gen_random_uuid()) j`)).rows[0].j===null,'unknown profile returns null');
+await db.exec(`reset role; create role auth_admin2 nologin; grant usage on schema auth to auth_admin2; grant insert on auth.users to auth_admin2; set role auth_admin2;`);
+await db.exec(`insert into auth.users values ('00000000-0000-0000-0000-0000000000ee','{"role":"provider","display_name":"Newbie"}'); reset role;`);
+ok((await db.query(`select services from profiles where id='00000000-0000-0000-0000-0000000000ee'`)).rows[0].services.length===0,'signup still creates profile (empty services)');
+await db.exec(`reset role; set role anon;`);
+for (const q of [`select * from profiles`,`select get_profile('${U.winner}')`]) { const r=await db.query(q).catch(e=>({err:e})); ok(!!r.err,'anon blocked: '+q.split('(')[0].slice(0,30)); }
 console.log(`\n${pass} passed, ${fail} failed`);
