@@ -3,6 +3,7 @@ import {supabase,configured} from './supabase.js';
 
 const $=s=>document.querySelector(s);
 let session=null, profile=null, activeChannel=null, notifChannel=null, unread=0;
+let ratings=new Map(), myReviews=new Set();
 const app=$('#app');
 
 function bell(){
@@ -78,6 +79,7 @@ function route(r,id){
   if(activeChannel){supabase.removeChannel(activeChannel);activeChannel=null;}
   if(r==='chat')return chat(id);
   if(r==='edit')return editWant(id);
+  if(r==='review')return reviewScreen(id);
   if(r==='notifications')return notifications();
   if(r==='auth')return auth();
   if(r==='dashboard')return dashboard();
@@ -107,8 +109,9 @@ function auth(msg=''){
   if(session){
     const name=profile?.display_name||session.user.user_metadata?.display_name||'WANT member';
     const role=(profile?.role||session.user.user_metadata?.role||'buyer')==='provider'?'Provider':'Buyer';
-    shell(`<section class="card narrow account-card"><p class="eyebrow">MY ACCOUNT</p><h2>${esc(name)}</h2><div class="account-row"><span>Account type</span><b>${role}</b></div><div class="account-row"><span>Email</span><b>${esc(session.user.email||'')}</b></div><div class="row"><button type="button" class="primary" data-go="dashboard">Go to Dashboard</button><button type="button" id="signout">Sign out</button></div></section>`);
+    shell(`<section class="card narrow account-card"><p class="eyebrow">MY ACCOUNT</p><h2>${esc(name)}</h2><div class="account-row"><span>Account type</span><b>${role}</b></div><div class="account-row"><span>Email</span><b>${esc(session.user.email||'')}</b></div><div class="account-row"><span>Your rating</span><b id="myRating">…</b></div><div class="row"><button type="button" class="primary" data-go="dashboard">Go to Dashboard</button><button type="button" id="signout">Sign out</button></div></section><section class="card narrow account-card" id="myReviewsCard"><p class="eyebrow">REVIEWS ABOUT YOU</p><div id="myReviews"><p class="muted-note">Loading…</p></div></section>`);
     $('#signout').onclick=signout;
+    loadAccountReviews();
     return;
   }
   shell(`<section class="card narrow"><p class="eyebrow">WELCOME TO WANT</p><h2>Join WANT</h2>${msg?`<p class="notice">${esc(msg)}</p>`:''}<input id="email" type="email" autocomplete="email" placeholder="Email"><input id="password" type="password" autocomplete="current-password" placeholder="Password"><input id="name" autocomplete="name" maxlength="80" placeholder="Display name"><select id="role"><option value="buyer">I want things</option><option value="provider">I provide things</option></select><div class="row"><button type="button" id="signup" class="primary">Create account</button><button type="button" id="signin">Sign in</button></div>${configured?'':'<p class="notice">Backend not connected yet.</p>'}</section>`);
@@ -151,6 +154,7 @@ async function dashboard(){
   if(profile?.role==='provider')return providerDash();
   const {data:intents,error}=await supabase.from('intents').select('*,offers!offers_intent_id_fkey(*)').eq('buyer_id',session.user.id).order('created_at',{ascending:false});
   if(error){console.error('Dashboard load:',error);return shell(`<section class="card"><h2>Could not load your WANTs</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
+  await loadReputation((intents||[]).flatMap(i=>(i.offers||[]).map(o=>o.provider_id)));
   shell(`<section><div class="head"><div><p class="eyebrow">BUYER DASHBOARD</p><h2>My WANTs</h2></div><button type="button" class="primary" data-go="home">+ New WANT</button></div>${(intents||[]).map(buyerCard).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
 }
 
@@ -172,12 +176,12 @@ function buyerCard(i){
       :`<p class="stage-note">Waiting for your provider to start the job. Use messages to agree on the details.</p>`;
     actions=`${note}<div class="actions"><button type="button" class="${st==='matched'?'':'primary'}" onclick="confirmCompleted('${id}')">${st==='awaiting'?'Confirm completed':'Mark as completed'}</button><button type="button" class="ghost danger" onclick="cancelWant('${id}',true)">Cancel job</button></div>`;
   }else if(i.status==='completed'){
-    actions=`<p class="done-note">Completed ✓${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}</p>`;
+    actions=`<p class="done-note">Completed ✓${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}</p>${myReviews.has(i.id)?'<p class="reviewed-note">You reviewed this job ✓</p>':`<div class="actions"><button type="button" class="primary" data-go="review" data-id="${id}">★ Leave a review</button></div>`}`;
   }else if(i.status==='cancelled'){
     actions=`<p class="muted-note">You cancelled this WANT${i.cancelled_at?' on '+esc(new Date(i.cancelled_at).toLocaleDateString()):''}.</p>`;
   }
   const offers=i.offers||[];
-  const offerRows=offers.map(o=>`<div class="offer"><div><b>$${esc(o.amount)}</b> ${esc(o.message||'')} ${pill(o.status)}</div>${i.status==='open'&&o.status==='pending'?`<button type="button" onclick="acceptOffer('${escAttr(o.id)}','${id}')">Accept</button>`:''}${o.status==='accepted'&&i.status!=='cancelled'?`<button type="button" class="${i.status==='matched'?'primary ':''}msg-btn" data-go="chat" data-id="${id}">${i.status==='matched'?'Message provider':'View conversation'}</button>`:''}</div>`).join('');
+  const offerRows=offers.map(o=>`<div class="offer"><div><b>$${esc(o.amount)}</b> ${ratingBadge(o.provider_id)} ${esc(o.message||'')} ${pill(o.status)}</div>${i.status==='open'&&o.status==='pending'?`<button type="button" onclick="acceptOffer('${escAttr(o.id)}','${id}')">Accept</button>`:''}${o.status==='accepted'&&i.status!=='cancelled'?`<button type="button" class="${i.status==='matched'?'primary ':''}msg-btn" data-go="chat" data-id="${id}">${i.status==='matched'?'Message provider':'View conversation'}</button>`:''}</div>`).join('');
   return `<article class="card${i.status==='cancelled'?' is-cancelled':''}">${pill(stage(i))}<h3>${esc(i.description)}</h3><p>${wantMeta(i)}${i.updated_at&&i.status==='open'?' • Edited':''}</p>${actions}<h4>${offers.length} offer(s)</h4>${offerRows}</article>`;
 }
 
@@ -188,7 +192,7 @@ function providerOfferCard(o){
     if(stage(i)==='matched')box=`<div class="match-box"><b>Matched ✓ Your offer was accepted.</b><p>Agree on the details with the buyer, then start the job when you begin.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">Message buyer</button><button type="button" class="primary" onclick="startJob('${id}')">Start job</button></div></div>`;
     else if(stage(i)==='in_progress')box=`<div class="match-box"><b>Job in progress</b><p>Started on ${fmtDay(i.started_at)}. Mark it as done when you've finished.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">Message buyer</button><button type="button" class="primary" onclick="markJobDone('${id}')">Mark job as done</button></div></div>`;
     else if(i.status==='matched')box=`<div class="match-box"><b>Job marked as done ✓</b><p>Waiting for the buyer to confirm it's completed.</p><button type="button" class="msg-btn" data-go="chat" data-id="${id}">Message buyer</button></div>`;
-    else if(i.status==='completed')box=`<div class="match-box done"><b>Job completed ✓</b><p>The buyer confirmed this job${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}.</p><button type="button" class="msg-btn" data-go="chat" data-id="${id}">View conversation</button></div>`;
+    else if(i.status==='completed')box=`<div class="match-box done"><b>Job completed ✓</b><p>The buyer confirmed this job${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">View conversation</button>${myReviews.has(o.intent_id)?'<span class="reviewed-note">You rated the buyer ✓</span>':`<button type="button" class="primary" data-go="review" data-id="${id}">★ Rate the buyer</button>`}</div></div>`;
     else if(i.status==='cancelled')box=`<p class="muted-note">The buyer cancelled this job.</p>`;
   }else if(i.status==='cancelled'){
     box=`<p class="muted-note">The buyer cancelled this WANT.</p>`;
@@ -241,6 +245,69 @@ window.markJobDone=async id=>{
   dashboard();
 };
 
+async function loadReputation(userIds){
+  const ids=[...new Set(userIds.filter(Boolean))];
+  const [r1,r2]=await Promise.all([
+    ids.length?supabase.from('user_ratings').select('user_id,avg_rating,review_count').in('user_id',ids):Promise.resolve({data:[]}),
+    supabase.from('reviews').select('intent_id').eq('reviewer_id',session.user.id)
+  ]);
+  if(r1.error)console.warn('Ratings:',r1.error.message);
+  if(r2.error)console.warn('My reviews:',r2.error.message);
+  ratings=new Map((r1.data||[]).map(r=>[r.user_id,r]));
+  myReviews=new Set((r2.data||[]).map(r=>r.intent_id));
+}
+
+function ratingBadge(userId){
+  const r=ratings.get(userId);
+  if(!r||!r.review_count)return '<span class="rating new">New</span>';
+  return `<span class="rating" title="${escAttr(r.avg_rating)} out of 5 from ${r.review_count} review${r.review_count===1?'':'s'}">★ ${esc(Number(r.avg_rating).toFixed(1))} <small>(${r.review_count})</small></span>`;
+}
+
+function starsText(n){return '★'.repeat(n)+'☆'.repeat(5-n);}
+
+async function loadAccountReviews(){
+  const box=$('#myReviews'), rate=$('#myRating');
+  const [{data:sum},{data:list,error}]=await Promise.all([
+    supabase.from('user_ratings').select('avg_rating,review_count').eq('user_id',session.user.id).maybeSingle(),
+    supabase.from('reviews').select('rating,comment,created_at,reviewer_id,profiles!reviews_reviewer_id_fkey(display_name)').eq('reviewee_id',session.user.id).order('created_at',{ascending:false}).limit(20)
+  ]);
+  if(!$('#myReviews'))return;
+  rate.innerHTML=sum&&sum.review_count?`<span class="rating">★ ${esc(Number(sum.avg_rating).toFixed(1))} <small>(${sum.review_count})</small></span>`:'<span class="rating new">No reviews yet</span>';
+  if(error){box.innerHTML=`<p class="notice">${esc(error.message)}</p>`;return;}
+  box.innerHTML=(list||[]).map(r=>`<div class="review"><div class="review-head"><span class="stars" aria-label="${r.rating} out of 5">${starsText(r.rating)}</span><span class="muted-note">${esc(r.profiles?.display_name||'WANT member')} • ${fmtDay(r.created_at)}</span></div>${r.comment?`<p class="review-body">${esc(r.comment)}</p>`:''}</div>`).join('')||'<p class="muted-note">Reviews appear here after you complete jobs.</p>';
+}
+
+async function reviewScreen(intentId){
+  if(!session)return auth('Sign in to leave a review.');
+  const fail=m=>shell(`<section class="card narrow"><h2>Can't review this job</h2><p class="notice">${esc(m)}</p><button type="button" data-go="dashboard">Back to dashboard</button></section>`);
+  const {data:i,error}=await supabase.from('intents').select('id,description,status,buyer_id,accepted_offer_id').eq('id',intentId).maybeSingle();
+  if(error)return fail(error.message);
+  if(!i||i.status!=='completed'||!i.accepted_offer_id)return fail('Reviews open once a job is completed.');
+  const {data:o}=await supabase.from('offers').select('provider_id,amount').eq('id',i.accepted_offer_id).maybeSingle();
+  const me=session.user.id, isBuyer=me===i.buyer_id;
+  if(!o||(!isBuyer&&me!==o.provider_id))return fail('Only the buyer and the hired provider can review this job.');
+  const otherId=isBuyer?o.provider_id:i.buyer_id;
+  const {data:other}=await supabase.from('profiles').select('display_name').eq('id',otherId).maybeSingle();
+  const {data:already}=await supabase.from('reviews').select('id').eq('intent_id',intentId).eq('reviewer_id',me).maybeSingle();
+  if(already)return fail('You already reviewed this job. Thank you!');
+  const who=esc(other?.display_name||(isBuyer?'your provider':'the buyer'));
+  shell(`<section class="narrow-wide"><button type="button" class="back" data-go="dashboard">← Dashboard</button><form id="reviewForm" class="card"><p class="eyebrow">${isBuyer?'RATE YOUR PROVIDER':'RATE THE BUYER'}</p><h2>How was it working with ${who}?</h2><p class="chat-want">${esc(i.description)} • $${esc(o.amount)}</p><fieldset class="star-input"><legend class="sr-only">Rating</legend>${[1,2,3,4,5].map(n=>`<label title="${n} star${n>1?'s':''}"><input type="radio" name="rating" value="${n}" required><span aria-hidden="true">★</span><span class="sr-only">${n} star${n>1?'s':''}</span></label>`).join('')}</fieldset><p class="hint" id="starHint">Tap a star to rate.</p><textarea name="comment" maxlength="1000" rows="4" placeholder="Optional: what went well, what could be better? (visible to other WANT members)"></textarea><div class="actions"><button class="primary">Submit review</button><button type="button" data-go="dashboard">Not now</button></div><p class="hint">Reviews can't be edited after you submit them.</p></form></section>`);
+  const form=$('#reviewForm'), labels=[...form.querySelectorAll('.star-input label')];
+  const words=['','Poor','Fair','Good','Very good','Excellent'];
+  form.querySelectorAll('input[name=rating]').forEach(inp=>inp.addEventListener('change',()=>{
+    const v=Number(inp.value); labels.forEach((l,k)=>l.classList.toggle('on',k<v)); $('#starHint').textContent=`${v} star${v>1?'s':''} — ${words[v]}`;
+  }));
+  form.onsubmit=async e=>{
+    e.preventDefault();
+    const f=new FormData(form), rating=Number(f.get('rating'));
+    if(!rating)return alert('Please choose a star rating.');
+    const btn=form.querySelector('.primary'); btn.disabled=true; btn.textContent='Submitting…';
+    const {error}=await supabase.rpc('submit_review',{p_intent_id:intentId,p_rating:rating,p_comment:(f.get('comment')||'').trim()});
+    if(error){btn.disabled=false;btn.textContent='Submit review';return alert(error.message);}
+    dashboard();
+  };
+}
+
 async function providerDash(){
   const [{data:intents,error:intentError},{data:offers,error:offerError}]=await Promise.all([
     supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false}),
@@ -248,8 +315,9 @@ async function providerDash(){
   ]);
   const error=intentError||offerError;
   if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load provider dashboard</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
+  await loadReputation([...(intents||[]).map(i=>i.buyer_id),...(offers||[]).map(o=>o.intents?.buyer_id)]);
   const mine=new Map((offers||[]).map(o=>[o.intent_id,o]));
-  const market=(intents||[]).map(i=>{const existing=mine.get(i.id);return `<article class="card"><h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}${i.deadline?' • Due '+formatDate(i.deadline):''}</p>${existing?`<p class="notice">Offer sent ✓ $${existing.amount} • ${esc(existing.status)}</p>`:`<form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" min="0" step="0.01" required placeholder="Your offer"><input name="message" maxlength="500" placeholder="Message / terms"><button>Send offer</button></div></form>`}</article>`}).join('');
+  const market=(intents||[]).map(i=>{const existing=mine.get(i.id);return `<article class="card"><h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}${i.deadline?' • Due '+formatDate(i.deadline):''}</p><p class="who">Buyer: ${esc(i.profiles?.display_name||'WANT member')} ${ratingBadge(i.buyer_id)}</p>${existing?`<p class="notice">Offer sent ✓ $${existing.amount} • ${esc(existing.status)}</p>`:`<form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" min="0" step="0.01" required placeholder="Your offer"><input name="message" maxlength="500" placeholder="Message / terms"><button>Send offer</button></div></form>`}</article>`}).join('');
   const myOffers=(offers||[]).map(providerOfferCard).join('');
   shell(`<section><p class="eyebrow">PROVIDER DASHBOARD</p><h2>Open WANTs</h2>${market||'<div class="empty">No open WANTs right now.</div>'}<div class="head provider-offers-head"><div><p class="eyebrow">YOUR ACTIVITY</p><h2>My Offers</h2></div></div>${myOffers||'<div class="empty">You have not sent any offers yet.</div>'}</section>`);
 }
@@ -311,7 +379,7 @@ async function chat(intentId){
   };
 }
 
-const NOTIF_ICON={new_offer:'💬',offer_accepted:'✅',offer_declined:'•',new_message:'✉️',want_edited:'✏️',want_cancelled:'✕',job_started:'▶️',job_done:'🧹',job_completed:'🎉'};
+const NOTIF_ICON={new_offer:'💬',offer_accepted:'✅',offer_declined:'•',new_message:'✉️',want_edited:'✏️',want_cancelled:'✕',job_started:'▶️',job_done:'🧹',job_completed:'🎉',review_received:'⭐'};
 
 async function notifications(){
   if(!session)return auth('Sign in to see your notifications.');
@@ -337,6 +405,7 @@ document.addEventListener('click',async e=>{
     refreshUnread();
   }
   const intent=n.dataset.intent,kind=n.dataset.kind;
+  if(kind==='review_received')return route('auth');
   if(intent&&(kind==='new_message'||kind==='offer_accepted'))return route('chat',intent);
   route('dashboard');
 });

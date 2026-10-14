@@ -18,11 +18,11 @@ alter default privileges in schema public grant all on tables to anon, authentic
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create publication supabase_realtime;
 `);
-for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql']) {
+for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql']) {
   await db.exec(fs.readFileSync(R+f,'utf8')); console.log('applied', f);
 }
-for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
-console.log('004-008 re-run in order OK (idempotent)');
+for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
+console.log('004-009 re-run in order OK (idempotent)');
 const U={buyer:'00000000-0000-0000-0000-00000000000b',winner:'00000000-0000-0000-0000-00000000000a',loser:'00000000-0000-0000-0000-00000000000c',stranger:'00000000-0000-0000-0000-00000000000d'};
 await db.exec(`create role auth_admin nologin; grant usage on schema auth to auth_admin; grant insert on auth.users to auth_admin; set role auth_admin;`);
 await db.exec(`insert into auth.users values
@@ -196,4 +196,43 @@ const QO=(await as('winner',`insert into offers(intent_id,provider_id,amount) va
 await as('buyer',`select accept_offer('${QO}','${Q}')`); await as('winner',`select start_job('${Q}')`); await as('buyer',`select cancel_intent('${Q}')`);
 ok(await st(Q)==='cancelled','buyer can cancel an in-progress job');
 await db.exec(`reset role; set role anon;`); const an8=await db.query(`select start_job('${Q}')`).catch(e=>({err:e})); ok(!!an8.err,'anon cannot call start_job');
+
+// 009 reviews
+const R1=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Wash car') returning id`)).rows[0].id;
+const R1O=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${R1}','${U.winner}',35) returning id`)).rows[0].id;
+await as('loser',`insert into offers(intent_id,provider_id,amount) values('${R1}','${U.loser}',30)`);
+await as('buyer',`select accept_offer('${R1O}','${R1}')`);
+await expectErr('buyer',`select submit_review('${R1}',5,'great')`,'cannot review before completion');
+await as('winner',`select start_job('${R1}')`); await as('winner',`select mark_job_done('${R1}')`);
+await expectErr('buyer',`select submit_review('${R1}',5,'great')`,'cannot review while awaiting confirmation');
+await as('buyer',`select confirm_completed('${R1}')`);
+await expectErr('loser',`select submit_review('${R1}',1,'spite')`,'losing provider cannot review');
+await expectErr('stranger',`select submit_review('${R1}',1,'x')`,'stranger cannot review');
+await expectErr('buyer',`select submit_review('${R1}',6,'x')`,'rating above 5 rejected');
+await expectErr('buyer',`select submit_review('${R1}',0,'x')`,'rating below 1 rejected');
+await expectErr('buyer',`select submit_review('${R1}',5,repeat('a',1001))`,'comment over 1000 chars rejected');
+await as('buyer',`select submit_review('${R1}',5,'  Spotless, on time  ')`);
+const rv=(await as('stranger',`select reviewer_id,reviewee_id,rating,comment from reviews where intent_id='${R1}'`)).rows;
+ok(rv.length===1&&rv[0].reviewee_id===U.winner&&rv[0].rating===5&&rv[0].comment==='Spotless, on time','buyer reviews provider (reviewee set automatically, comment trimmed)');
+ok(await cnt('winner',`kind='review_received' and intent_id='${R1}'`)===1,'provider notified of review');
+await expectErr('buyer',`select submit_review('${R1}',4,'again')`,'cannot review the same job twice');
+await as('winner',`select submit_review('${R1}',4,null)`);
+ok((await as('buyer',`select reviewee_id from reviews where intent_id='${R1}' and reviewer_id='${U.winner}'`)).rows[0].reviewee_id===U.buyer,'provider reviews buyer (no comment ok)');
+await expectErr('buyer',`insert into reviews(intent_id,reviewer_id,reviewee_id,rating) values('${R1}','${U.buyer}','${U.loser}',1)`,'cannot insert reviews directly');
+const ru=await as('buyer',`update reviews set rating=1 returning id`).catch(e=>({err:e})); ok(ru.err||ru.rows.length===0,'cannot edit reviews');
+const rd=await as('winner',`delete from reviews returning id`).catch(e=>({err:e})); ok(rd.err||rd.rows.length===0,'cannot delete reviews');
+// second job to check average
+const R2=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Rake leaves') returning id`)).rows[0].id;
+const R2O=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${R2}','${U.winner}',25) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${R2O}','${R2}')`); await as('buyer',`select confirm_completed('${R2}')`);
+await as('buyer',`select submit_review('${R2}',4,'')`);
+const ur=(await as('loser',`select avg_rating::float a, review_count from user_ratings where user_id='${U.winner}'`)).rows[0];
+ok(ur&&ur.a===4.5&&ur.review_count===2,'rating summary: 4.5 from 2 reviews, visible to other signed-in users');
+ok((await as('buyer',`select comment from reviews where intent_id='${R2}' and reviewer_id='${U.buyer}'`)).rows[0].comment===null,'blank comment stored as empty');
+const M2=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Cancelled job') returning id`)).rows[0].id;
+const M2O=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${M2}','${U.winner}',10) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${M2O}','${M2}')`); await as('buyer',`select cancel_intent('${M2}')`);
+await expectErr('buyer',`select submit_review('${M2}',1,'x')`,'cannot review a cancelled job');
+await db.exec(`reset role; set role anon;`);
+for (const q of [`select * from reviews`,`select * from user_ratings`,`select submit_review('${R1}',5,'x')`]) { const r=await db.query(q).catch(e=>({err:e})); ok(!!r.err,'anon blocked: '+q.split(' ').slice(0,4).join(' ')); }
 console.log(`\n${pass} passed, ${fail} failed`);
