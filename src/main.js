@@ -3,7 +3,7 @@ import {supabase,configured} from './supabase.js';
 
 const $=s=>document.querySelector(s);
 let session=null, profile=null, activeChannel=null, notifChannel=null, unread=0;
-let ratings=new Map(), myReviews=new Set();
+let ratings=new Map(), myReviews=new Set(), people=new Map();
 const app=$('#app');
 
 function bell(){
@@ -80,6 +80,8 @@ function route(r,id){
   if(r==='chat')return chat(id);
   if(r==='edit')return editWant(id);
   if(r==='review')return reviewScreen(id);
+  if(r==='profile')return profilePage(id);
+  if(r==='editProfile')return editProfile();
   if(r==='notifications')return notifications();
   if(r==='auth')return auth();
   if(r==='dashboard')return dashboard();
@@ -109,7 +111,7 @@ function auth(msg=''){
   if(session){
     const name=profile?.display_name||session.user.user_metadata?.display_name||'WANT member';
     const role=(profile?.role||session.user.user_metadata?.role||'buyer')==='provider'?'Provider':'Buyer';
-    shell(`<section class="card narrow account-card"><p class="eyebrow">MY ACCOUNT</p><h2>${esc(name)}</h2><div class="account-row"><span>Account type</span><b>${role}</b></div><div class="account-row"><span>Email</span><b>${esc(session.user.email||'')}</b></div><div class="account-row"><span>Your rating</span><b id="myRating">…</b></div><div class="row"><button type="button" class="primary" data-go="dashboard">Go to Dashboard</button><button type="button" id="signout">Sign out</button></div></section><section class="card narrow account-card" id="myReviewsCard"><p class="eyebrow">REVIEWS ABOUT YOU</p><div id="myReviews"><p class="muted-note">Loading…</p></div></section>`);
+    shell(`<section class="card narrow account-card"><p class="eyebrow">MY ACCOUNT</p><h2>${esc(name)}</h2><div class="account-row"><span>Account type</span><b>${role}</b></div><div class="account-row"><span>Email</span><b>${esc(session.user.email||'')}</b></div><div class="account-row"><span>Your rating</span><b id="myRating">…</b></div><div class="actions"><button type="button" class="primary" data-go="editProfile">Edit profile</button><button type="button" data-go="profile" data-id="${escAttr(session.user.id)}">View public profile</button></div><div class="row"><button type="button" data-go="dashboard">Go to Dashboard</button><button type="button" id="signout">Sign out</button></div></section><section class="card narrow account-card" id="myReviewsCard"><p class="eyebrow">REVIEWS ABOUT YOU</p><div id="myReviews"><p class="muted-note">Loading…</p></div></section>`);
     $('#signout').onclick=signout;
     loadAccountReviews();
     return;
@@ -181,7 +183,7 @@ function buyerCard(i){
     actions=`<p class="muted-note">You cancelled this WANT${i.cancelled_at?' on '+esc(new Date(i.cancelled_at).toLocaleDateString()):''}.</p>`;
   }
   const offers=i.offers||[];
-  const offerRows=offers.map(o=>`<div class="offer"><div><b>$${esc(o.amount)}</b> ${ratingBadge(o.provider_id)} ${esc(o.message||'')} ${pill(o.status)}</div>${i.status==='open'&&o.status==='pending'?`<button type="button" onclick="acceptOffer('${escAttr(o.id)}','${id}')">Accept</button>`:''}${o.status==='accepted'&&i.status!=='cancelled'?`<button type="button" class="${i.status==='matched'?'primary ':''}msg-btn" data-go="chat" data-id="${id}">${i.status==='matched'?'Message provider':'View conversation'}</button>`:''}</div>`).join('');
+  const offerRows=offers.map(o=>`<div class="offer"><div><b>$${esc(o.amount)}</b> ${personLink(o.provider_id,'Provider')} ${ratingBadge(o.provider_id)} ${esc(o.message||'')} ${pill(o.status)}</div>${i.status==='open'&&o.status==='pending'?`<button type="button" onclick="acceptOffer('${escAttr(o.id)}','${id}')">Accept</button>`:''}${o.status==='accepted'&&i.status!=='cancelled'?`<button type="button" class="${i.status==='matched'?'primary ':''}msg-btn" data-go="chat" data-id="${id}">${i.status==='matched'?'Message provider':'View conversation'}</button>`:''}</div>`).join('');
   return `<article class="card${i.status==='cancelled'?' is-cancelled':''}">${pill(stage(i))}<h3>${esc(i.description)}</h3><p>${wantMeta(i)}${i.updated_at&&i.status==='open'?' • Edited':''}</p>${actions}<h4>${offers.length} offer(s)</h4>${offerRows}</article>`;
 }
 
@@ -247,10 +249,12 @@ window.markJobDone=async id=>{
 
 async function loadReputation(userIds){
   const ids=[...new Set(userIds.filter(Boolean))];
-  const [r1,r2]=await Promise.all([
+  const [r1,r2,r3]=await Promise.all([
     ids.length?supabase.from('user_ratings').select('user_id,avg_rating,review_count').in('user_id',ids):Promise.resolve({data:[]}),
-    supabase.from('reviews').select('intent_id').eq('reviewer_id',session.user.id)
+    supabase.from('reviews').select('intent_id').eq('reviewer_id',session.user.id),
+    ids.length?supabase.from('profiles').select('id,display_name').in('id',ids):Promise.resolve({data:[]})
   ]);
+  people=new Map((r3.data||[]).map(p=>[p.id,p.display_name]));
   if(r1.error)console.warn('Ratings:',r1.error.message);
   if(r2.error)console.warn('My reviews:',r2.error.message);
   ratings=new Map((r1.data||[]).map(r=>[r.user_id,r]));
@@ -274,7 +278,7 @@ async function loadAccountReviews(){
   if(!$('#myReviews'))return;
   rate.innerHTML=sum&&sum.review_count?`<span class="rating">★ ${esc(Number(sum.avg_rating).toFixed(1))} <small>(${sum.review_count})</small></span>`:'<span class="rating new">No reviews yet</span>';
   if(error){box.innerHTML=`<p class="notice">${esc(error.message)}</p>`;return;}
-  box.innerHTML=(list||[]).map(r=>`<div class="review"><div class="review-head"><span class="stars" aria-label="${r.rating} out of 5">${starsText(r.rating)}</span><span class="muted-note">${esc(r.profiles?.display_name||'WANT member')} • ${fmtDay(r.created_at)}</span></div>${r.comment?`<p class="review-body">${esc(r.comment)}</p>`:''}</div>`).join('')||'<p class="muted-note">Reviews appear here after you complete jobs.</p>';
+  box.innerHTML=reviewsHtml(list)||'<p class="muted-note">Reviews appear here after you complete jobs.</p>';
 }
 
 async function reviewScreen(intentId){
@@ -308,6 +312,54 @@ async function reviewScreen(intentId){
   };
 }
 
+function personLink(id,fallback){
+  if(!id)return '';
+  const name=people.get(id)||fallback||'WANT member';
+  return `<button type="button" class="link" data-go="profile" data-id="${escAttr(id)}">${esc(name)}</button>`;
+}
+
+function reviewsHtml(list){
+  return (list||[]).map(r=>`<div class="review"><div class="review-head"><span class="stars" aria-label="${r.rating} out of 5">${starsText(r.rating)}</span><span class="muted-note">${esc(r.profiles?.display_name||'WANT member')} • ${fmtDay(r.created_at)}</span></div>${r.comment?`<p class="review-body">${esc(r.comment)}</p>`:''}</div>`).join('');
+}
+
+async function profilePage(userId){
+  if(!session)return auth('Sign in to view profiles.');
+  if(!userId)return dashboard();
+  const [{data:p,error},{data:list}]=await Promise.all([
+    supabase.rpc('get_profile',{p_user_id:userId}),
+    supabase.from('reviews').select('rating,comment,created_at,profiles!reviews_reviewer_id_fkey(display_name)').eq('reviewee_id',userId).order('created_at',{ascending:false}).limit(20)
+  ]);
+  if(error||!p)return shell(`<section class="card narrow"><h2>Profile not found</h2><p class="notice">${esc(error?.message||'This profile does not exist.')}</p><button type="button" data-go="dashboard">Back to dashboard</button></section>`);
+  const isMe=userId===session.user.id, isProvider=p.role==='provider';
+  const name=p.display_name||(isProvider?'Provider':'WANT member');
+  const initials=name.split(/\s+/).map(w=>w[0]||'').join('').slice(0,2).toUpperCase()||'?';
+  const rating=p.review_count?`<span class="rating big">★ ${esc(Number(p.avg_rating).toFixed(1))} <small>(${p.review_count} review${p.review_count===1?'':'s'})</small></span>`:'<span class="rating new">No reviews yet</span>';
+  const stat=(n,l)=>`<div class="stat"><b>${esc(n)}</b><span>${esc(l)}</span></div>`;
+  shell(`<section class="narrow-wide profile"><button type="button" class="back" data-go="dashboard">← Dashboard</button><div class="card profile-card"><div class="profile-head"><div class="avatar" aria-hidden="true">${esc(initials)}</div><div><p class="eyebrow">${isProvider?'PROVIDER':'BUYER'}</p><h2>${esc(name)}</h2><div class="profile-meta">${rating}${p.service_area?`<span class="muted-note">📍 ${esc(p.service_area)}</span>`:''}</div></div></div><div class="stats">${isProvider?stat(p.completed_jobs,'jobs completed'):stat(p.completed_wants,'WANTs completed')}${stat(p.review_count,'reviews')}${stat(new Date(p.member_since).toLocaleDateString([], {month:'short',year:'numeric'}),'member since')}</div>${p.bio?`<p class="bio">${esc(p.bio)}</p>`:`<p class="muted-note">${isMe?'Add a short bio so people know who you are.':'No bio yet.'}</p>`}${isProvider&&(p.services||[]).length?`<div class="chips">${p.services.map(x=>`<span class="chip">${esc(x)}</span>`).join('')}</div>`:''}${isMe?`<div class="actions"><button type="button" class="primary" data-go="editProfile">Edit profile</button></div>`:''}</div><div class="card"><p class="eyebrow">REVIEWS</p>${reviewsHtml(list)||'<p class="muted-note">No reviews yet.</p>'}</div></section>`);
+}
+
+function editProfile(){
+  if(!session)return auth('Sign in to edit your profile.');
+  const p=profile||{}, isProvider=p.role==='provider';
+  shell(`<section class="narrow-wide"><button type="button" class="back" data-go="auth">← Account</button><form id="profileForm" class="card"><p class="eyebrow">EDIT PROFILE</p><label class="field">Display name<input name="display_name" maxlength="80" required value="${escAttr(p.display_name||'')}" placeholder="How people will see you"></label><label class="field">Service area<input name="service_area" maxlength="120" value="${escAttr(p.service_area||'')}" placeholder="City or area, e.g. Denver metro — not a street address"></label>${isProvider?`<label class="field">Services you offer<input name="services" value="${escAttr((p.services||[]).join(', '))}" placeholder="e.g. Home cleaning, Deep cleaning, Move-out cleaning"><span class="hint">Separate with commas. Up to 10, each up to 40 characters.</span></label>`:''}<label class="field">Bio<textarea name="bio" maxlength="600" rows="4" placeholder="${isProvider?'Your experience, what makes you reliable, availability…':'A sentence about you (optional)'}">${esc(p.bio||'')}</textarea><span class="hint"><span id="bioCount">${(p.bio||'').length}</span>/600 • Visible to signed-in WANT members. Don't include phone numbers or addresses.</span></label><div class="actions"><button class="primary">Save profile</button><button type="button" data-go="auth">Cancel</button></div></form></section>`);
+  const form=$('#profileForm');
+  form.bio.addEventListener('input',()=>{$('#bioCount').textContent=form.bio.value.length;});
+  form.onsubmit=async e=>{
+    e.preventDefault();
+    const f=new FormData(form);
+    const display_name=(f.get('display_name')||'').trim();
+    if(!display_name)return alert('Please enter a display name.');
+    const services=isProvider?[...new Set((f.get('services')||'').split(',').map(x=>x.trim()).filter(Boolean))]:(p.services||[]);
+    if(services.length>10)return alert('Please list up to 10 services.');
+    if(services.some(x=>x.length>40))return alert('Each service can be up to 40 characters.');
+    const btn=form.querySelector('.primary');btn.disabled=true;btn.textContent='Saving…';
+    const {error}=await supabase.from('profiles').update({display_name,service_area:(f.get('service_area')||'').trim()||null,bio:(f.get('bio')||'').trim()||null,services,updated_at:new Date().toISOString()}).eq('id',session.user.id);
+    if(error){btn.disabled=false;btn.textContent='Save profile';return alert(error.message);}
+    await loadProfile();
+    profilePage(session.user.id);
+  };
+}
+
 async function providerDash(){
   const [{data:intents,error:intentError},{data:offers,error:offerError}]=await Promise.all([
     supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false}),
@@ -317,9 +369,10 @@ async function providerDash(){
   if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load provider dashboard</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
   await loadReputation([...(intents||[]).map(i=>i.buyer_id),...(offers||[]).map(o=>o.intents?.buyer_id)]);
   const mine=new Map((offers||[]).map(o=>[o.intent_id,o]));
-  const market=(intents||[]).map(i=>{const existing=mine.get(i.id);return `<article class="card"><h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}${i.deadline?' • Due '+formatDate(i.deadline):''}</p><p class="who">Buyer: ${esc(i.profiles?.display_name||'WANT member')} ${ratingBadge(i.buyer_id)}</p>${existing?`<p class="notice">Offer sent ✓ $${existing.amount} • ${esc(existing.status)}</p>`:`<form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" min="0" step="0.01" required placeholder="Your offer"><input name="message" maxlength="500" placeholder="Message / terms"><button>Send offer</button></div></form>`}</article>`}).join('');
+  const market=(intents||[]).map(i=>{const existing=mine.get(i.id);return `<article class="card"><h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}${i.deadline?' • Due '+formatDate(i.deadline):''}</p><p class="who">Buyer: ${personLink(i.buyer_id,i.profiles?.display_name||'WANT member')} ${ratingBadge(i.buyer_id)}</p>${existing?`<p class="notice">Offer sent ✓ $${existing.amount} • ${esc(existing.status)}</p>`:`<form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" min="0" step="0.01" required placeholder="Your offer"><input name="message" maxlength="500" placeholder="Message / terms"><button>Send offer</button></div></form>`}</article>`}).join('');
   const myOffers=(offers||[]).map(providerOfferCard).join('');
-  shell(`<section><p class="eyebrow">PROVIDER DASHBOARD</p><h2>Open WANTs</h2>${market||'<div class="empty">No open WANTs right now.</div>'}<div class="head provider-offers-head"><div><p class="eyebrow">YOUR ACTIVITY</p><h2>My Offers</h2></div></div>${myOffers||'<div class="empty">You have not sent any offers yet.</div>'}</section>`);
+  const incomplete=!profile?.display_name||(!profile?.bio&&!(profile?.services||[]).length);
+  shell(`<section>${incomplete?`<div class="card nudge"><div><b>Complete your profile</b><p>Buyers choose providers they trust. Add your name, the services you offer and a short bio.</p></div><button type="button" class="primary" data-go="editProfile">Complete profile</button></div>`:''}<p class="eyebrow">PROVIDER DASHBOARD</p><h2>Open WANTs</h2>${market||'<div class="empty">No open WANTs right now.</div>'}<div class="head provider-offers-head"><div><p class="eyebrow">YOUR ACTIVITY</p><h2>My Offers</h2></div></div>${myOffers||'<div class="empty">You have not sent any offers yet.</div>'}</section>`);
 }
 
 async function chat(intentId){
@@ -344,7 +397,7 @@ async function chat(intentId){
   const otherLabel=nameOf(otherId);
   const canSend=intent.status==='matched';
   const seen=new Set();
-  shell(`<section class="chat"><button type="button" class="back" data-go="dashboard">← Dashboard</button><div class="card chat-card"><div class="chat-head"><p class="eyebrow">PRIVATE CONVERSATION</p><h2>${esc(otherLabel)}</h2><p class="chat-want">${esc(intent.description)} • Accepted offer $${esc(offer.amount)}</p><p class="chat-privacy">Only you and ${esc(otherLabel)} can see these messages.</p></div><div id="msgs" class="msgs" aria-live="polite"></div>${canSend?`<form id="composer" class="composer"><textarea name="body" maxlength="2000" rows="2" placeholder="Write a message…" required></textarea><button class="primary">Send</button></form>`:`<p class="notice">This WANT is ${esc(intent.status)}. The conversation is read-only.</p>`}</div></section>`);
+  shell(`<section class="chat"><button type="button" class="back" data-go="dashboard">← Dashboard</button><div class="card chat-card"><div class="chat-head"><p class="eyebrow">PRIVATE CONVERSATION</p><h2>${esc(otherLabel)} <button type="button" class="link small" data-go="profile" data-id="${escAttr(otherId)}">View profile</button></h2><p class="chat-want">${esc(intent.description)} • Accepted offer $${esc(offer.amount)}</p><p class="chat-privacy">Only you and ${esc(otherLabel)} can see these messages.</p></div><div id="msgs" class="msgs" aria-live="polite"></div>${canSend?`<form id="composer" class="composer"><textarea name="body" maxlength="2000" rows="2" placeholder="Write a message…" required></textarea><button class="primary">Send</button></form>`:`<p class="notice">This WANT is ${esc(intent.status)}. The conversation is read-only.</p>`}</div></section>`);
   const list=$('#msgs');
   const add=m=>{
     if(seen.has(m.id))return;
