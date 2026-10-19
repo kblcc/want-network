@@ -18,11 +18,11 @@ alter default privileges in schema public grant all on tables to anon, authentic
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create publication supabase_realtime;
 `);
-for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql']) {
+for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql','migrations/011_categories.sql']) {
   await db.exec(fs.readFileSync(R+f,'utf8')); console.log('applied', f);
 }
-for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
-console.log('004-010 re-run in order OK (idempotent)');
+for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql','migrations/011_categories.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
+console.log('004-011 re-run in order OK (idempotent)');
 const U={buyer:'00000000-0000-0000-0000-00000000000b',winner:'00000000-0000-0000-0000-00000000000a',loser:'00000000-0000-0000-0000-00000000000c',stranger:'00000000-0000-0000-0000-00000000000d'};
 await db.exec(`create role auth_admin nologin; grant usage on schema auth to auth_admin; grant insert on auth.users to auth_admin; set role auth_admin;`);
 await db.exec(`insert into auth.users values
@@ -262,4 +262,32 @@ await db.exec(`insert into auth.users values ('00000000-0000-0000-0000-000000000
 ok((await db.query(`select services from profiles where id='00000000-0000-0000-0000-0000000000ee'`)).rows[0].services.length===0,'signup still creates profile (empty services)');
 await db.exec(`reset role; set role anon;`);
 for (const q of [`select * from profiles`,`select get_profile('${U.winner}')`]) { const r=await db.query(q).catch(e=>({err:e})); ok(!!r.err,'anon blocked: '+q.split('(')[0].slice(0,30)); }
+
+// 011 categories + matching
+await as('winner',`update profiles set categories=array['cleaning','yard'], service_area='Denver metro' where id='${U.winner}'`);
+await as('loser',`update profiles set categories=array['cleaning'], service_area='Boulder' where id='${U.loser}'`);
+await expectErr('winner',`update profiles set categories=array['spaceships'] where id='${U.winner}'`,'unknown provider category rejected');
+const nw=async u=>(await as(u,`select count(*)::int n from notifications where kind='new_want'`)).rows[0].n;
+const w0=await nw('winner'), l0=await nw('loser');
+const C1=(await as('buyer',`insert into intents(buyer_id,description,category,location,budget_max) values('${U.buyer}','Clean my condo','cleaning','Denver',120) returning id`)).rows[0].id;
+ok(await nw('winner')===w0+1,'matching provider (category + Denver ~ Denver metro) notified of new WANT');
+ok(await nw('loser')===l0,'provider in another area (Boulder) not notified');
+ok((await as('winner',`select body from notifications where kind='new_want' and intent_id='${C1}'`)).rows[0].body.includes('$120'),'new WANT notification includes budget');
+await as('buyer',`insert into intents(buyer_id,description,category,location) values('${U.buyer}','Fix my sink','plumbing','Denver')`);
+ok(await nw('winner')===w0+1,'no notification for categories the provider does not serve');
+await as('buyer',`insert into intents(buyer_id,description,category) values('${U.buyer}','Clean anywhere','cleaning')`);
+ok(await nw('winner')===w0+2&&await nw('loser')===l0+1,'WANT without location notifies all providers serving the category');
+await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Old-style WANT, no category')`); ok(true,'WANT without category still allowed (old app compatible)');
+await expectErr('buyer',`insert into intents(buyer_id,description,category) values('${U.buyer}','x','spaceships')`,'unknown WANT category rejected');
+await as('buyer',`select set_intent_category('${C1}','yard')`);
+ok((await as('buyer',`select category from intents where id='${C1}'`)).rows[0].category==='yard','buyer can change category of open WANT');
+await expectErr('stranger',`select set_intent_category('${C1}','other')`,'other user cannot change category');
+await expectErr('buyer',`select set_intent_category('${C1}','spaceships')`,'set_intent_category rejects unknown category');
+await expectErr('buyer',`select set_intent_category('${R1}','other')`,'cannot change category of completed WANT');
+ok((await as('stranger',`select get_profile('${U.winner}') j`)).rows[0].j.categories.length===2,'public profile lists provider categories');
+const ann=await as('winner',`select notify_matching_providers()`).catch(e=>({err:e})); ok(!!ann.err,'matching trigger function not callable via API');
+await db.exec(`reset role; set role anon;`); const an11=await db.query(`select set_intent_category('${C1}','other')`).catch(e=>({err:e})); ok(!!an11.err,'anon cannot call set_intent_category');
+for (const [a,b,exp] of [['Denver metro','Denver',true],['Aurora, CO','aurora',true],['Boulder','Denver',false],[null,'Denver',true],['  ','x',true]]) {
+  await db.exec('reset role;'); ok((await db.query(`select places_match($1,$2) m`,[a,b])).rows[0].m===exp,`places_match(${a},${b})=${exp}`);
+}
 console.log(`\n${pass} passed, ${fail} failed`);
