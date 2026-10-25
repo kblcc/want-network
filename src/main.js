@@ -1,36 +1,16 @@
 import './style.css';
 import {supabase,configured} from './supabase.js';
+import {CATEGORIES as PARSE_CATS,CATEGORY_ORDER,guessCategory,parseWant,parseAnswer,friendlyDate,ymd} from './want-parse.js';
 
 const $=s=>document.querySelector(s);
 let session=null, profile=null, activeChannel=null, notifChannel=null, unread=0;
 let ratings=new Map(), myReviews=new Set(), people=new Map();
 
-// Keep in sync with want_categories() in supabase/migrations/011_categories.sql
-const CATEGORIES=[
-  ['cleaning','Cleaning','🧽',/clean|maid|tidy|vacuum|mop|laundry|dust/],
-  ['handyman','Handyman & repairs','🔧',/fix|repair|handyman|assemble|assembly|ikea|mount|shelf|shelves|furniture|door|drywall/],
-  ['plumbing','Plumbing','🚰',/plumb|leak|sink|toilet|faucet|drain|pipe|water heater|clog/],
-  ['electrical','Electrical','💡',/electric|outlet|wiring|light fixture|breaker|switch|ceiling fan/],
-  ['moving','Moving & hauling','📦',/move|moving|haul|couch|sofa|truck|junk|boxes|pack/],
-  ['yard','Lawn & garden','🌿',/lawn|mow|yard|garden|leaves|rake|snow|tree|hedge|weed|gutter/],
-  ['painting','Painting','🎨',/paint|fence|stain|wall/],
-  ['pets','Pet care','🐾',/dog|cat|pet|walk my|groom|sitter/],
-  ['tutoring','Tutoring & lessons','📚',/tutor|lesson|teach|homework|math|english|piano|guitar|class/],
-  ['tech','Tech help','💻',/computer|laptop|phone|wifi|wi-fi|printer|website|tech|install|setup|tv/],
-  ['beauty','Beauty & wellness','💇',/hair|nail|makeup|massage|beauty|barber|braid/],
-  ['events','Events & photography','🎉',/party|event|wedding|photo|dj|cater|birthday|decor/],
-  ['errands','Errands & delivery','🛒',/errand|deliver|pick up|pickup|grocer|shopping|drop off/],
-  ['other','Other','✨',null]
-];
+// Category list lives in want-parse.js; shown here in display order.
+const CATEGORIES=CATEGORY_ORDER.map(k=>PARSE_CATS.find(c=>c[0]===k));
 const CAT=Object.fromEntries(CATEGORIES.map(([k,l,i])=>[k,{label:l,icon:i}]));
-function guessCategory(text){const t=(text||'').toLowerCase();for(const [k,,,re] of CATEGORIES){if(re&&re.test(t))return k;}return '';}
 function catChip(k){return k&&CAT[k]?`<span class="cat-chip">${CAT[k].icon} ${esc(CAT[k].label)}</span>`:'';}
 function catOptions(sel,placeholder){return `${placeholder?`<option value="">${esc(placeholder)}</option>`:''}${CATEGORIES.map(([k,l,i])=>`<option value="${k}"${k===sel?' selected':''}>${i} ${esc(l)}</option>`).join('')}`;}
-function wireCategoryGuess(textarea,select){
-  let touched=!!select.value;
-  select.addEventListener('change',()=>{touched=true;});
-  textarea.addEventListener('input',()=>{ if(touched)return; const g=guessCategory(textarea.value); select.value=g; select.classList.toggle('guessed',!!g); });
-}
 let marketState={intents:[],mine:new Map(),cat:'mine',picked:null,loc:''};
 const app=$('#app');
 
@@ -116,26 +96,118 @@ function route(r,id){
   return home();
 }
 
+// ---------- Conversational posting ("What do you want?")
+const DRAFT_KEY='want:draft';
+const FOLLOW_UPS={
+  category:{q:"Which category fits best?"},
+  location:{q:"Where should this happen? A city or area is enough — no street address.",ph:'e.g. Aurora',skip:'Anywhere / remote'},
+  budget:{q:"What's your budget?",ph:'e.g. $100',skip:'Open to offers'},
+  deadline:{q:"When do you need it?",ph:'e.g. tomorrow, Friday, 11/3',skip:'Flexible'}
+};
+let convo=null;
+const saveDraft=()=>{try{sessionStorage.setItem(DRAFT_KEY,JSON.stringify(convo));}catch(e){}};
+const loadDraft=()=>{try{return JSON.parse(sessionStorage.getItem(DRAFT_KEY)||'null');}catch(e){return null;}};
+const clearDraft=()=>{try{sessionStorage.removeItem(DRAFT_KEY);}catch(e){}};
+
 function home(){
-  const minDate=new Date().toISOString().slice(0,10);
-  shell(`<section class="hero"><p class="eyebrow">THE MARKET COMES TO YOU</p><h1>What do you want?</h1><p>Say what you need. Providers compete to fulfill it.</p><form id="intent"><textarea maxlength="1000" placeholder="I want my apartment cleaned tomorrow under $120" required></textarea><label class="cat-field"><span>Category</span><select name="category" required>${catOptions('','Choose a category')}</select></label><div class="row"><input name="budget" type="number" min="0" step="0.01" placeholder="Max budget"><input name="location" maxlength="120" placeholder="City or area — don't enter a street address"><input name="deadline" type="date" min="${minDate}"></div><button class="primary">Create my WANT →</button></form></section>`);
-  $('#intent').onsubmit=postIntent;
-  wireCategoryGuess($('#intent textarea'),$('#intent select[name=category]'));
+  const restored=loadDraft();
+  convo=restored&&restored.draft?restored:{draft:null,asked:[],log:[],pending:null};
+  const examples=['Fix a leaking sink tomorrow in Aurora, around $100','Walk my dog this weekend in Denver','Deep clean my apartment before move-out, under $200'];
+  shell(`<section class="hero convo-hero"><p class="eyebrow">THE MARKET COMES TO YOU</p><h1>What do you want?</h1><p>Just say it the way you'd tell a friend. Providers compete to do it.</p>
+  <div class="card convo"><div id="convoLog" class="convo-log" aria-live="polite"></div>
+  <div id="examples" class="examples">${examples.map(x=>`<button type="button" class="example">${esc(x)}</button>`).join('')}</div>
+  <form id="composer" class="composer convo-composer"><textarea id="say" rows="2" maxlength="1000" placeholder="I want…" aria-label="What do you want?"></textarea><button class="primary" aria-label="Send">→</button></form></div></section>`);
+  const say=$('#say');
+  document.querySelectorAll('.example').forEach(b=>b.onclick=()=>{say.value=b.textContent;say.focus();});
+  say.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#composer').requestSubmit();}});
+  $('#composer').onsubmit=e=>{e.preventDefault();const t=say.value.trim();if(!t)return;say.value='';onSay(t);};
+  if(convo.draft){ if(convo.pending&&convo.qIndex!=null)convo.log=convo.log.slice(0,convo.qIndex); convo.log.forEach(m=>bubble(m.who,m.html,false)); step(); }
+  else say.focus();
 }
 
-async function postIntent(e){
+function bubble(who,html,record=true){
+  const log=$('#convoLog'); if(!log)return;
+  const el=document.createElement('div'); el.className='bubble '+who; el.innerHTML=html; log.appendChild(el);
+  if(record&&convo){convo.log.push({who,html});saveDraft();}
+  $('#examples')?.remove();
+  el.scrollIntoView({block:'nearest',behavior:'smooth'});
+  return el;
+}
+
+function onSay(text){
+  bubble('me',esc(text));
+  if(!convo.draft){
+    convo.draft=parseWant(text);
+    const d=convo.draft, got=[];
+    if(d.category)got.push(`${CAT[d.category].icon} ${esc(CAT[d.category].label)}`);
+    if(d.location)got.push(`📍 ${esc(d.location)}`);
+    if(d.budget!=null)got.push(`💵 up to $${esc(d.budget)}`);
+    if(d.deadline)got.push(`📅 ${esc(friendlyDate(d.deadline))}`);
+    bubble('bot',got.length?`Got it! I picked up: ${got.map(g=>`<span class="pick">${g}</span>`).join(' ')}`:'Got it!');
+    return step();
+  }
+  const f=convo.pending; if(!f)return;
+  const skip=/^(skip|no|none|nope|not sure|idk|don'?t know|any|anywhere|flexible|open|whatever)\b/i.test(text);
+  const val=skip?null:parseAnswer(f,text);
+  if(!skip&&val==null){bubble('bot',f==='budget'?"I couldn't find an amount — try something like <b>$80</b>, or tap <b>Open to offers</b>.":f==='deadline'?"I couldn't read that date — try <b>tomorrow</b>, <b>Friday</b> or <b>11/3</b>, or tap <b>Flexible</b>.":"Could you say that another way?");return;}
+  convo.draft[f]=val; convo.asked.push(f); convo.pending=null; saveDraft();
+  step();
+}
+
+function step(){
+  const d=convo.draft;
+  const missing=['category','location','budget','deadline'].find(f=>(d[f]==null||d[f]==='')&&!convo.asked.includes(f));
+  if(!missing){convo.pending=null;saveDraft();return reviewCard();}
+  convo.pending=missing; convo.qIndex=convo.log.length; saveDraft();
+  const fu=FOLLOW_UPS[missing];
+  if(missing==='category'){
+    const el=bubble('bot',`${fu.q}<div class="cat-quick">${CATEGORIES.map(([k,l,i])=>`<button type="button" data-cat="${k}">${i} ${esc(l)}</button>`).join('')}</div>`);
+    el.querySelectorAll('[data-cat]').forEach(b=>b.onclick=()=>{convo.draft.category=b.dataset.cat;convo.asked.push('category');convo.pending=null;bubble('me',`${CAT[b.dataset.cat].icon} ${esc(CAT[b.dataset.cat].label)}`);step();});
+  }else{
+    const el=bubble('bot',`${esc(fu.q)} <button type="button" class="skip">${esc(fu.skip)}</button>`);
+    el.querySelector('.skip').onclick=()=>onSay(fu.skip);
+    const say=$('#say'); if(say){say.placeholder=fu.ph;say.focus();}
+  }
+  $('#composer').hidden=false;
+}
+
+function reviewCard(){
+  $('#composer').hidden=true;
+  const d=convo.draft, minDate=ymd(new Date());
+  const el=bubble('bot',`<b>Here's your WANT.</b> Check it and post — you can still change anything.
+  <form id="reviewWant" class="review-want">
+    <label class="field">What you want<textarea name="description" maxlength="1000" rows="2" required>${esc(d.description)}</textarea></label>
+    <div class="review-grid">
+      <label class="field">Category<select name="category" required>${catOptions(d.category||'','Choose a category')}</select></label>
+      <label class="field">Location<input name="location" maxlength="120" value="${escAttr(d.location||'')}" placeholder="Anywhere / remote"></label>
+      <label class="field">Budget ($)<input name="budget" type="number" min="0" step="0.01" value="${d.budget??''}" placeholder="Open to offers"></label>
+      <label class="field">When<input name="deadline" type="date" min="${minDate}" value="${escAttr(d.deadline&&d.deadline>=minDate?d.deadline:'')}"></label>
+    </div>
+    <div class="actions"><button class="primary">Post my WANT →</button><button type="button" id="startOver" class="ghost">Start over</button></div>
+  </form>`,false);
+  el.querySelector('#startOver').onclick=()=>{clearDraft();convo=null;home();};
+  el.querySelector('#reviewWant').onsubmit=postWant;
+}
+
+async function postWant(e){
   e.preventDefault();
-  if(!session)return auth('Sign in to publish your WANT.');
-  if(profile?.role!=='buyer')return alert('Only buyer accounts can publish WANTs.');
-  const f=new FormData(e.target),description=e.target.querySelector('textarea').value.trim();
+  const form=e.target, f=new FormData(form);
+  const description=(f.get('description')||'').trim();
   if(!description)return alert('Tell providers what you want.');
-  const category=f.get('category')||guessCategory(description)||'other';
-  const btn=e.target.querySelector('button.primary');
-  btn.disabled=true;btn.textContent='Publishing…';
-  const {error}=await supabase.from('intents').insert({buyer_id:session.user.id,description,category,budget_max:f.get('budget')||null,location:(f.get('location')||'').trim(),deadline:f.get('deadline')||null});
-  if(error){btn.disabled=false;btn.textContent='Create my WANT →';return alert(error.message);}
+  convo.draft={...convo.draft,description,category:f.get('category')||null,location:(f.get('location')||'').trim()||null,budget:f.get('budget')===''?null:Number(f.get('budget')),deadline:f.get('deadline')||null};
+  saveDraft();
+  if(!session)return auth('Sign in or create a buyer account to post your WANT — your draft is saved.');
+  if(profile?.role!=='buyer')return alert('Only buyer accounts can publish WANTs. Sign in with a buyer account to post this.');
+  const d=convo.draft, btn=form.querySelector('.primary');
+  btn.disabled=true;btn.textContent='Posting…';
+  const {error}=await supabase.from('intents').insert({buyer_id:session.user.id,description:d.description,category:d.category||guessCategory(d.description)||'other',budget_max:d.budget,location:d.location||'',deadline:d.deadline});
+  if(error){btn.disabled=false;btn.textContent='Post my WANT →';return alert(error.message);}
+  clearDraft(); convo=null;
   await dashboard();
 }
+
+// After signing in, go back to an unfinished WANT if there is one.
+function afterLogin(){ const d=loadDraft(); return d&&d.draft&&profile?.role==='buyer'?home():dashboard(); }
 
 function auth(msg=''){
   if(session){
@@ -157,7 +229,7 @@ async function signup(){
   if(!email||!password)return alert('Enter your email and password.');
   const {data,error}=await supabase.auth.signUp({email,password,options:{data:{display_name,role},emailRedirectTo:window.location.origin}});
   if(error)return alert(error.message);
-  if(data.session){session=data.session;await loadProfile();return dashboard();}
+  if(data.session){session=data.session;await loadProfile();return afterLogin();}
   alert('Account created. Please confirm your email, then come back here and sign in.');
 }
 
@@ -165,7 +237,7 @@ async function signout(){
   if(!configured)return;
   const {error}=await supabase.auth.signOut();
   if(error)return alert(error.message);
-  session=null;profile=null;stopNotifications();auth('You have been signed out.');
+  session=null;profile=null;stopNotifications();clearDraft();auth('You have been signed out.');
 }
 
 async function signin(){
@@ -178,7 +250,7 @@ async function signin(){
   session=data.session;
   if(!session){btn.disabled=false;btn.textContent='Sign in';return alert('Please confirm your email first.');}
   await loadProfile();
-  dashboard();
+  afterLogin();
 }
 
 async function dashboard(){
