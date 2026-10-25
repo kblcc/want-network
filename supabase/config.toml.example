@@ -1,0 +1,4 @@
+# Reference only (functions are deployed through Supabase). The webhook must
+# accept Stripe's calls without a Supabase login; it checks Stripe's signature instead.
+[functions.stripe-webhook]
+verify_jwt = false
