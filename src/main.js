@@ -5,6 +5,7 @@ import {CATEGORIES as PARSE_CATS,CATEGORY_ORDER,guessCategory,parseWant,parseAns
 const $=s=>document.querySelector(s);
 let session=null, profile=null, activeChannel=null, notifChannel=null, unread=0;
 let ratings=new Map(), myReviews=new Set(), people=new Map();
+let payMap=new Map(), payoutAcct=null, payCfg={payments_enabled:false,fee_percent:10};
 
 // Category list lives in want-parse.js; shown here in display order.
 const CATEGORIES=CATEGORY_ORDER.map(k=>PARSE_CATS.find(c=>c[0]===k));
@@ -80,8 +81,50 @@ async function boot(){
       if(event==='SIGNED_OUT'){profile=null;stopNotifications();route('home');}
     });
   }
+  if(session&&handleReturnFromStripe())return;
   route('home');
 }
+
+// Back from Stripe Checkout / payout onboarding.
+function handleReturnFromStripe(){
+  const q=new URLSearchParams(location.search);
+  const payment=q.get('payment'), payouts=q.get('payouts');
+  if(!payment&&!payouts)return false;
+  history.replaceState(null,'',location.pathname);
+  if(payment==='success'){toast('Payment received ✓ WANT holds it until you confirm the job is done.');dashboard();setTimeout(()=>{if($('.buyer-dash'))dashboard();},4000);}
+  else if(payment==='cancelled'){toast('Payment cancelled — you were not charged.');dashboard();}
+  else if(payouts){refreshPayouts(true);}
+  return true;
+}
+
+function toast(msg){
+  document.querySelector('.toast')?.remove();
+  const t=document.createElement('div');t.className='toast';t.setAttribute('role','status');t.textContent=msg;document.body.appendChild(t);
+  setTimeout(()=>t.classList.add('show'),10);setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},5000);
+}
+
+// Calls a Supabase Edge Function and turns errors into readable messages.
+async function callFn(name,body){
+  const {data,error}=await supabase.functions.invoke(name,{body});
+  if(error){
+    let msg=error.message;
+    try{const j=await error.context?.json?.();if(j?.error)msg=j.error;}catch(e){}
+    throw new Error(msg||'Something went wrong. Please try again.');
+  }
+  return data;
+}
+
+async function loadPayments(field){
+  const [cfg,pays,acct]=await Promise.all([
+    supabase.from('app_config').select('payments_enabled,fee_percent').maybeSingle(),
+    supabase.from('payments').select('intent_id,status,amount_cents,fee_cents,paid_at,released_at,refunded_at').eq(field,session.user.id),
+    field==='provider_id'?supabase.from('payout_accounts').select('details_submitted,payouts_enabled').maybeSingle():Promise.resolve({data:null})
+  ]);
+  if(cfg.data)payCfg=cfg.data;
+  payMap=new Map((pays.data||[]).map(p=>[p.intent_id,p]));
+  payoutAcct=acct.data||null;
+}
+const money=c=>'$'+(c/100).toFixed(2).replace(/\.00$/,'');
 
 function route(r,id){
   if(activeChannel){supabase.removeChannel(activeChannel);activeChannel=null;}
@@ -258,8 +301,8 @@ async function dashboard(){
   if(profile?.role==='provider')return providerDash();
   const {data:intents,error}=await supabase.from('intents').select('*,offers!offers_intent_id_fkey(*)').eq('buyer_id',session.user.id).order('created_at',{ascending:false});
   if(error){console.error('Dashboard load:',error);return shell(`<section class="card"><h2>Could not load your WANTs</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
-  await loadReputation((intents||[]).flatMap(i=>(i.offers||[]).map(o=>o.provider_id)));
-  shell(`<section><div class="head"><div><p class="eyebrow">BUYER DASHBOARD</p><h2>My WANTs</h2></div><button type="button" class="primary" data-go="home">+ New WANT</button></div>${(intents||[]).map(buyerCard).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
+  await Promise.all([loadReputation((intents||[]).flatMap(i=>(i.offers||[]).map(o=>o.provider_id))),loadPayments('buyer_id')]);
+  shell(`<section class="buyer-dash"><div class="head"><div><p class="eyebrow">BUYER DASHBOARD</p><h2>My WANTs</h2></div><button type="button" class="primary" data-go="home">+ New WANT</button></div>${(intents||[]).map(buyerCard).join('')||'<div class="empty">No WANTs yet.</div>'}</section>`);
 }
 
 const STATUS_LABEL={open:'Open',matched:'Matched',in_progress:'In progress',awaiting:'Awaiting confirmation',completed:'Completed',cancelled:'Cancelled',closed:'Closed',pending:'Pending',accepted:'Accepted',declined:'Declined',withdrawn:'Withdrawn'};
@@ -273,6 +316,17 @@ function buyerCard(i){
   let actions='';
   if(i.status==='open'){
     actions=`<div class="actions"><button type="button" data-go="edit" data-id="${id}">Edit</button><button type="button" class="ghost danger" onclick="cancelWant('${id}',false)">Cancel WANT</button></div>`;
+  }else if(i.status==='matched'&&i.payment_required){
+    const st=stage(i), p=payMap.get(i.id), held=p?.status==='held';
+    const amount=(i.offers||[]).find(o=>o.status==='accepted')?.amount;
+    if(!held){
+      actions=`<div class="pay-box"><b>💳 Pay to confirm the booking</b><p>Pay $${esc(amount)} securely through WANT. Your money is <b>held</b> — the provider only gets paid after you confirm the job is done.</p><div class="actions"><button type="button" class="primary" onclick="payNow('${id}',this)">Pay $${esc(amount)} securely</button><button type="button" class="ghost danger" onclick="cancelWant('${id}',true)">Cancel job</button></div></div>`;
+    }else{
+      const note=st==='awaiting'?`<p class="notice">Your provider marked the job as done on ${fmtDay(i.provider_done_at)}. If you're happy, confirm to release the payment.</p>`
+        :st==='in_progress'?`<p class="stage-note">Job in progress since ${fmtDay(i.started_at)}.</p>`
+        :`<p class="stage-note">Waiting for your provider to start the job. Use messages to agree on the details.</p>`;
+      actions=`<p class="paid-note">✓ Paid ${money(p.amount_cents)} — held by WANT until you confirm</p>${note}<div class="actions"><button type="button" class="${st==='matched'?'':'primary'}" onclick="releasePayment('${id}',this)">Confirm completed & release payment</button>${st==='matched'?`<button type="button" class="ghost danger" onclick="refundWant('${id}',this)">Cancel & refund</button>`:''}</div>${st!=='matched'?'<p class="hint">Problem with the job? Message your provider first. Refunds after the job has started are handled by WANT support.</p>':''}`;
+    }
   }else if(i.status==='matched'){
     const st=stage(i);
     const note=st==='awaiting'?`<p class="notice">Your provider marked the job as done on ${fmtDay(i.provider_done_at)}. Please confirm once you're satisfied.</p>`
@@ -280,9 +334,11 @@ function buyerCard(i){
       :`<p class="stage-note">Waiting for your provider to start the job. Use messages to agree on the details.</p>`;
     actions=`${note}<div class="actions"><button type="button" class="${st==='matched'?'':'primary'}" onclick="confirmCompleted('${id}')">${st==='awaiting'?'Confirm completed':'Mark as completed'}</button><button type="button" class="ghost danger" onclick="cancelWant('${id}',true)">Cancel job</button></div>`;
   }else if(i.status==='completed'){
-    actions=`<p class="done-note">Completed ✓${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}</p>${myReviews.has(i.id)?'<p class="reviewed-note">You reviewed this job ✓</p>':`<div class="actions"><button type="button" class="primary" data-go="review" data-id="${id}">★ Leave a review</button></div>`}`;
+    const pc=payMap.get(i.id);
+    actions=`<p class="done-note">Completed ✓${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}</p>${pc?`<p class="paid-note">Paid ${money(pc.amount_cents)} through WANT ${pc.status==='released'?'• released to provider ✓':'• release to provider in progress'}</p>`:''}${myReviews.has(i.id)?'<p class="reviewed-note">You reviewed this job ✓</p>':`<div class="actions"><button type="button" class="primary" data-go="review" data-id="${id}">★ Leave a review</button></div>`}`;
   }else if(i.status==='cancelled'){
-    actions=`<p class="muted-note">You cancelled this WANT${i.cancelled_at?' on '+esc(new Date(i.cancelled_at).toLocaleDateString()):''}.</p>`;
+    const pr=payMap.get(i.id);
+    actions=`<p class="muted-note">You cancelled this WANT${i.cancelled_at?' on '+esc(new Date(i.cancelled_at).toLocaleDateString()):''}.</p>${pr?.status==='refunded'?`<p class="paid-note">Refunded ${money(pr.amount_cents)} ✓ (usually 5–10 business days to appear on your card)</p>`:''}`;
   }
   const offers=i.offers||[];
   const offerRows=offers.map(o=>`<div class="offer"><div><b>$${esc(o.amount)}</b> ${personLink(o.provider_id,'Provider')} ${ratingBadge(o.provider_id)} ${esc(o.message||'')} ${pill(o.status)}</div>${i.status==='open'&&o.status==='pending'?`<button type="button" onclick="acceptOffer('${escAttr(o.id)}','${id}')">Accept</button>`:''}${o.status==='accepted'&&i.status!=='cancelled'?`<button type="button" class="${i.status==='matched'?'primary ':''}msg-btn" data-go="chat" data-id="${id}">${i.status==='matched'?'Message provider':'View conversation'}</button>`:''}</div>`).join('');
@@ -292,11 +348,14 @@ function buyerCard(i){
 function providerOfferCard(o){
   const i=o.intents||{}, id=escAttr(o.intent_id);
   let box='';
-  if(o.status==='accepted'){
-    if(stage(i)==='matched')box=`<div class="match-box"><b>Matched ✓ Your offer was accepted.</b><p>Agree on the details with the buyer, then start the job when you begin.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">Message buyer</button><button type="button" class="primary" onclick="startJob('${id}')">Start job</button></div></div>`;
+  const pp=payMap.get(o.intent_id), paidReq=i.payment_required&&i.status==='matched';
+  if(o.status==='accepted'&&paidReq&&pp?.status!=='held'){
+    box=`<div class="match-box"><b>Matched ✓ Your offer was accepted.</b><p>⏳ <b>Waiting for the buyer's payment.</b> You'll be notified as soon as they pay — then you can start the job.</p><button type="button" class="msg-btn" data-go="chat" data-id="${id}">Message buyer</button></div>`;
+  }else if(o.status==='accepted'){
+    if(stage(i)==='matched')box=(paidReq?`<p class="paid-note">✓ Buyer paid ${money(pp.amount_cents)} — held by WANT until completion. You'll receive ${money(pp.amount_cents-pp.fee_cents)} after WANT's fee.</p>`:'')+`<div class="match-box"><b>Matched ✓ Your offer was accepted.</b><p>Agree on the details with the buyer, then start the job when you begin.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">Message buyer</button><button type="button" class="primary" onclick="startJob('${id}')">Start job</button></div></div>`;
     else if(stage(i)==='in_progress')box=`<div class="match-box"><b>Job in progress</b><p>Started on ${fmtDay(i.started_at)}. Mark it as done when you've finished.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">Message buyer</button><button type="button" class="primary" onclick="markJobDone('${id}')">Mark job as done</button></div></div>`;
     else if(i.status==='matched')box=`<div class="match-box"><b>Job marked as done ✓</b><p>Waiting for the buyer to confirm it's completed.</p><button type="button" class="msg-btn" data-go="chat" data-id="${id}">Message buyer</button></div>`;
-    else if(i.status==='completed')box=`<div class="match-box done"><b>Job completed ✓</b><p>The buyer confirmed this job${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">View conversation</button>${myReviews.has(o.intent_id)?'<span class="reviewed-note">You rated the buyer ✓</span>':`<button type="button" class="primary" data-go="review" data-id="${id}">★ Rate the buyer</button>`}</div></div>`;
+    else if(i.status==='completed')box=(pp?`<p class="paid-note">${pp.status==='released'?`💸 Paid out ${money(pp.amount_cents-pp.fee_cents)} to your Stripe account ✓`:`💸 Payout of ${money(pp.amount_cents-pp.fee_cents)} ${payoutAcct?.payouts_enabled?'is being sent':'is waiting — <button type="button" class="link small-inline" onclick="setupPayouts(this)">set up payouts</button> to receive it'}`}</p>`:'')+`<div class="match-box done"><b>Job completed ✓</b><p>The buyer confirmed this job${i.completed_at?' on '+esc(new Date(i.completed_at).toLocaleDateString()):''}.</p><div class="actions"><button type="button" data-go="chat" data-id="${id}">View conversation</button>${myReviews.has(o.intent_id)?'<span class="reviewed-note">You rated the buyer ✓</span>':`<button type="button" class="primary" data-go="review" data-id="${id}">★ Rate the buyer</button>`}</div></div>`;
     else if(i.status==='cancelled')box=`<p class="muted-note">The buyer cancelled this job.</p>`;
   }else if(i.status==='cancelled'){
     box=`<p class="muted-note">The buyer cancelled this WANT.</p>`;
@@ -326,6 +385,44 @@ async function editWant(id){
     }
     dashboard();
   };
+}
+
+const busy=(btn,text)=>{if(btn){btn.dataset.label=btn.textContent;btn.disabled=true;btn.textContent=text;}};
+const unbusy=btn=>{if(btn){btn.disabled=false;btn.textContent=btn.dataset.label||btn.textContent;}};
+window.payNow=async(id,btn)=>{
+  busy(btn,'Opening secure checkout…');
+  try{const {url}=await callFn('stripe-checkout',{intent_id:id});location.href=url;}
+  catch(e){unbusy(btn);alert(e.message);}
+};
+window.releasePayment=async(id,btn)=>{
+  if(!confirm('Confirm the job is completed? Your payment will be released to the provider. This cannot be undone.'))return;
+  busy(btn,'Releasing…');
+  try{const r=await callFn('stripe-release',{intent_id:id,action:'complete'});toast(r.released?'Job completed ✓ Payment released to your provider.':'Job completed ✓ '+(r.note||''));dashboard();}
+  catch(e){unbusy(btn);alert(e.message);}
+};
+window.refundWant=async(id,btn)=>{
+  if(!confirm('Cancel this job and get a full refund? The provider will be notified.'))return;
+  busy(btn,'Refunding…');
+  try{await callFn('stripe-release',{intent_id:id,action:'cancel'});toast('Job cancelled. Your refund is on its way (usually 5–10 business days).');dashboard();}
+  catch(e){unbusy(btn);alert(e.message);}
+};
+window.setupPayouts=async btn=>{
+  busy(btn,'Opening Stripe…');
+  try{const {url}=await callFn('stripe-connect',{action:'onboard'});location.href=url;}
+  catch(e){unbusy(btn);alert(e.message);}
+};
+window.openPayoutDashboard=async btn=>{
+  busy(btn,'Opening…');
+  try{const {url}=await callFn('stripe-connect',{action:'dashboard'});window.open(url,'_blank','noopener');}
+  catch(e){alert(e.message);}finally{unbusy(btn);}
+};
+async function refreshPayouts(fromStripe){
+  try{
+    const r=await callFn('stripe-connect',{action:'status'});
+    const sent=(r.released||[]).filter(x=>x.ok).length;
+    if(fromStripe)toast(r.payouts_enabled?`Payouts active ✓${sent?` — ${sent} waiting payout${sent>1?'s':''} sent.`:''}`:'Payout setup saved. Stripe may need a bit more information — you can continue anytime.');
+  }catch(e){if(fromStripe)toast(e.message);}
+  dashboard();
 }
 
 window.cancelWant=async(id,matched)=>{
@@ -487,11 +584,11 @@ function renderMarket(){
 async function providerDash(){
   const [{data:intents,error:intentError},{data:offers,error:offerError}]=await Promise.all([
     supabase.from('intents').select('*,profiles!intents_buyer_id_fkey(display_name)').eq('status','open').order('created_at',{ascending:false}),
-    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents!offers_intent_id_fkey(id,buyer_id,description,location,budget_max,deadline,status,started_at,provider_done_at,completed_at,cancelled_at)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
+    supabase.from('offers').select('intent_id,status,amount,message,created_at,intents!offers_intent_id_fkey(id,buyer_id,description,location,budget_max,deadline,status,started_at,provider_done_at,completed_at,cancelled_at,payment_required)').eq('provider_id',session.user.id).order('created_at',{ascending:false})
   ]);
   const error=intentError||offerError;
   if(error){console.error('Provider dashboard load:',error);return shell(`<section class="card"><h2>Could not load provider dashboard</h2><p class="notice">${esc(error.message)}</p><button type="button" data-go="dashboard">Try again</button></section>`);}
-  await loadReputation([...(intents||[]).map(i=>i.buyer_id),...(offers||[]).map(o=>o.intents?.buyer_id)]);
+  await Promise.all([loadReputation([...(intents||[]).map(i=>i.buyer_id),...(offers||[]).map(o=>o.intents?.buyer_id)]),loadPayments('provider_id')]);
   const mine=new Map((offers||[]).map(o=>[o.intent_id,o]));
   const myCats=profile?.categories||[];
   const picked=marketState.picked;
@@ -500,7 +597,10 @@ async function providerDash(){
   const market='<div id="marketList"></div>';
   const myOffers=(offers||[]).map(providerOfferCard).join('');
   const incomplete=!profile?.display_name||(!profile?.bio&&!(profile?.services||[]).length);
-  shell(`<section>${incomplete?`<div class="card nudge"><div><b>Complete your profile</b><p>Buyers choose providers they trust. Add your name, the services you offer and a short bio.</p></div><button type="button" class="primary" data-go="editProfile">Complete profile</button></div>`:''}<p class="eyebrow">PROVIDER DASHBOARD</p><h2>Open WANTs</h2><div class="filters"><select id="fCat" aria-label="Category">${myCats.length?`<option value="mine">⭐ My services</option>`:''}<option value="all">All categories</option>${CATEGORIES.map(([k,l,ic])=>`<option value="${k}">${ic} ${esc(l)}</option>`).join('')}</select><input id="fLoc" type="search" placeholder="Filter by city or area" aria-label="Location" value="${escAttr(marketState.loc)}"></div>${myCats.length?'':`<p class="hint">Tip: choose the categories you serve in <button type="button" class="link small-inline" data-go="editProfile">your profile</button> to filter and get notified about matching WANTs.</p>`}${market}<div class="head provider-offers-head"><div><p class="eyebrow">YOUR ACTIVITY</p><h2>My Offers</h2></div></div>${myOffers||'<div class="empty">You have not sent any offers yet.</div>'}</section>`);
+  const payoutBanner=!payCfg.payments_enabled?'':payoutAcct?.payouts_enabled
+    ?`<div class="payout-bar ok"><span>💸 <b>Payouts active</b> — you're paid automatically when buyers confirm completed jobs.</span><button type="button" class="link small-inline" onclick="openPayoutDashboard(this)">Stripe dashboard</button></div>`
+    :`<div class="card nudge pay"><div><b>${payoutAcct?'Finish setting up payouts':'Set up payouts to get paid'}</b><p>Buyers pay through WANT. Connect a bank account with Stripe (secure, takes a few minutes) so we can send you your earnings minus WANT's ${esc(Number(payCfg.fee_percent))}% fee.</p></div><button type="button" class="primary" onclick="setupPayouts(this)">${payoutAcct?'Continue setup':'Set up payouts'}</button></div>`;
+  shell(`<section>${payoutBanner}${incomplete?`<div class="card nudge"><div><b>Complete your profile</b><p>Buyers choose providers they trust. Add your name, the services you offer and a short bio.</p></div><button type="button" class="primary" data-go="editProfile">Complete profile</button></div>`:''}<p class="eyebrow">PROVIDER DASHBOARD</p><h2>Open WANTs</h2><div class="filters"><select id="fCat" aria-label="Category">${myCats.length?`<option value="mine">⭐ My services</option>`:''}<option value="all">All categories</option>${CATEGORIES.map(([k,l,ic])=>`<option value="${k}">${ic} ${esc(l)}</option>`).join('')}</select><input id="fLoc" type="search" placeholder="Filter by city or area" aria-label="Location" value="${escAttr(marketState.loc)}"></div>${myCats.length?'':`<p class="hint">Tip: choose the categories you serve in <button type="button" class="link small-inline" data-go="editProfile">your profile</button> to filter and get notified about matching WANTs.</p>`}${market}<div class="head provider-offers-head"><div><p class="eyebrow">YOUR ACTIVITY</p><h2>My Offers</h2></div></div>${myOffers||'<div class="empty">You have not sent any offers yet.</div>'}</section>`);
   $('#fCat').value=marketState.cat;
   $('#fCat').onchange=e=>{marketState.cat=marketState.picked=e.target.value;renderMarket();};
   $('#fLoc').oninput=e=>{marketState.loc=e.target.value;renderMarket();};
@@ -564,7 +664,7 @@ async function chat(intentId){
   };
 }
 
-const NOTIF_ICON={new_offer:'💬',offer_accepted:'✅',offer_declined:'•',new_message:'✉️',want_edited:'✏️',want_cancelled:'✕',job_started:'▶️',job_done:'🧹',job_completed:'🎉',review_received:'⭐',new_want:'📣'};
+const NOTIF_ICON={new_offer:'💬',offer_accepted:'✅',offer_declined:'•',new_message:'✉️',want_edited:'✏️',want_cancelled:'✕',job_started:'▶️',job_done:'🧹',job_completed:'🎉',review_received:'⭐',new_want:'📣',payment_held:'💳'};
 
 async function notifications(){
   if(!session)return auth('Sign in to see your notifications.');

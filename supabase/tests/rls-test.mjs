@@ -8,7 +8,7 @@ import fs from 'fs';
 const R=new URL('../', import.meta.url).pathname;
 const db = new PGlite({ extensions: { pgcrypto } });
 await db.exec(`
-create role anon nologin; create role authenticated nologin;
+create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls;
 create schema auth; grant usage on schema auth to anon, authenticated;
 create table auth.users(id uuid primary key, raw_user_meta_data jsonb);
 create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('test.uid', true),'')::uuid $$;
@@ -18,11 +18,11 @@ alter default privileges in schema public grant all on tables to anon, authentic
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create publication supabase_realtime;
 `);
-for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql','migrations/011_categories.sql']) {
+for (const f of ['schema.sql','migrations/002_marketplace_security.sql','migrations/003_fix_rls_recursion.sql','migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql','migrations/011_categories.sql','migrations/012_payments.sql']) {
   await db.exec(fs.readFileSync(R+f,'utf8')); console.log('applied', f);
 }
-for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql','migrations/011_categories.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
-console.log('004-011 re-run in order OK (idempotent)');
+for (const f of ['migrations/004_messaging.sql','migrations/005_security_cleanup.sql','migrations/006_notifications.sql','migrations/007_want_lifecycle.sql','migrations/008_start_job.sql','migrations/009_reviews.sql','migrations/010_profiles.sql','migrations/011_categories.sql','migrations/012_payments.sql']) await db.exec(fs.readFileSync(R+f,'utf8'));
+console.log('004-012 re-run in order OK (idempotent)');
 const U={buyer:'00000000-0000-0000-0000-00000000000b',winner:'00000000-0000-0000-0000-00000000000a',loser:'00000000-0000-0000-0000-00000000000c',stranger:'00000000-0000-0000-0000-00000000000d'};
 await db.exec(`create role auth_admin nologin; grant usage on schema auth to auth_admin; grant insert on auth.users to auth_admin; set role auth_admin;`);
 await db.exec(`insert into auth.users values
@@ -290,4 +290,80 @@ await db.exec(`reset role; set role anon;`); const an11=await db.query(`select s
 for (const [a,b,exp] of [['Denver metro','Denver',true],['Aurora, CO','aurora',true],['Boulder','Denver',false],[null,'Denver',true],['  ','x',true]]) {
   await db.exec('reset role;'); ok((await db.query(`select places_match($1,$2) m`,[a,b])).rows[0].m===exp,`places_match(${a},${b})=${exp}`);
 }
+
+// 012 payments
+const svc=async q=>{await db.exec(`reset role; set role service_role;`);try{return await db.query(q);}finally{await db.exec('reset role;');}};
+const pst=async id=>(await db.query(`select status from payments where intent_id='${id}'`)).rows[0]?.status;
+// payments OFF: nothing changes
+const P0=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Off job') returning id`)).rows[0].id;
+const P0O=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${P0}','${U.winner}',50) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${P0O}','${P0}')`);
+ok((await db.query(`select payment_required r from intents where id='${P0}'`)).rows[0].r===false,'payments off: match does not require payment');
+await as('winner',`select start_job('${P0}')`); await as('buyer',`select confirm_completed('${P0}')`);
+ok(await st(P0)==='completed','payments off: old flow unchanged');
+// payments ON
+await db.exec(`reset role; update app_config set payments_enabled=true, fee_percent=10;`);
+ok((await as('stranger',`select payments_enabled from app_config`)).rows[0].payments_enabled===true,'signed-in users can read config');
+await expectErr('buyer',`update app_config set fee_percent=0`,'clients cannot change config');
+const P1=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Paid job') returning id`)).rows[0].id;
+const P1O=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${P1}','${U.winner}',100) returning id`)).rows[0].id;
+await as('loser',`insert into offers(intent_id,provider_id,amount) values('${P1}','${U.loser}',90)`);
+await as('buyer',`select accept_offer('${P1O}','${P1}')`);
+ok((await db.query(`select payment_required r from intents where id='${P1}'`)).rows[0].r===true,'payments on: match requires payment');
+await expectErr('winner',`select start_job('${P1}')`,'provider cannot start before payment');
+await expectErr('winner',`select mark_job_done('${P1}')`,'provider cannot mark done before payment');
+await expectErr('buyer',`select confirm_completed('${P1}')`,'buyer cannot complete without paying');
+// clients cannot touch money functions or tables
+for (const f of [`internal_prepare_payment('${P1}','${U.buyer}')`,`internal_mark_paid('x','pi','ch',10000)`,`internal_complete_paid_job('${P1}','${U.buyer}')`,`internal_record_refund(gen_random_uuid(),'r',true)`,`internal_upsert_payout_account('${U.winner}','acct_x',true,true,true)`]) await expectErr('buyer',`select ${f}`,'client blocked: '+f.split('(')[0]);
+await expectErr('buyer',`insert into payments(intent_id,offer_id,buyer_id,provider_id,amount_cents,fee_cents) values('${P1}','${P1O}','${U.buyer}','${U.winner}',1,0)`,'client cannot insert payments');
+// edge function path
+let r12=(await svc(`select internal_prepare_payment('${P1}','${U.buyer}') j`)).rows[0].j;
+ok(r12.amount_cents===10000&&r12.fee_cents===1000,'prepare: $100 → fee $10');
+let bad=await svc(`select internal_prepare_payment('${P1}','${U.stranger}')`).catch(e=>({err:e})); ok(!!bad.err,'prepare rejects non-owner');
+await svc(`select internal_set_checkout_session('${r12.payment_id}','cs_test_1')`);
+ok((await svc(`select internal_mark_paid('cs_test_1','pi_1','ch_1',9999) j`)).rows[0].j.ok===false,'amount mismatch rejected');
+// reset to pending for the real flow
+await db.exec(`update payments set status='pending' where id='${r12.payment_id}'`);
+let mp=(await svc(`select internal_mark_paid('cs_test_1','pi_1','ch_1',10000) j`)).rows[0].j;
+ok(mp.ok&&!mp.needs_refund&&await pst(P1)==='held','webhook marks payment held');
+ok((await svc(`select internal_mark_paid('cs_test_1','pi_1','ch_1',10000) j`)).rows[0].j.duplicate===true,'duplicate webhook is harmless');
+ok(await cnt('winner',`kind='payment_held' and intent_id='${P1}'`)===1,'provider notified of held payment');
+ok((await as('buyer',`select status from payments where intent_id='${P1}'`)).rows.length===1,'buyer sees own payment');
+ok((await as('winner',`select status from payments where intent_id='${P1}'`)).rows.length===1,'provider sees own payment');
+ok((await as('loser',`select * from payments`)).rows.length===0,'losing provider sees no payments');
+ok((await as('stranger',`select * from payments`)).rows.length===0,'stranger sees no payments');
+await expectErr('buyer',`select cancel_intent('${P1}')`,'plain cancel blocked once paid (must refund)');
+await expectErr('buyer',`select confirm_completed('${P1}')`,'plain confirm blocked (must release)');
+await as('winner',`select start_job('${P1}')`); await as('winner',`select mark_job_done('${P1}')`); ok(true,'provider can start + mark done after payment');
+bad=await svc(`select internal_check_refundable('${P1}','${U.buyer}')`).catch(e=>({err:e})); ok(!!bad.err,'no self-service refund after the job started');
+let cp=(await svc(`select internal_complete_paid_job('${P1}','${U.buyer}') j`)).rows[0].j;
+ok(cp.transfer_cents===9000&&cp.destination===null&&await st(P1)==='completed'&&await pst(P1)==='release_pending','complete: WANT completed, $90 payout pending (no payout account yet)');
+await svc(`select internal_upsert_payout_account('${U.winner}','acct_win',true,true,true)`);
+ok((await as('winner',`select stripe_account_id from payout_accounts`)).rows[0].stripe_account_id==='acct_win','provider reads own payout account');
+ok((await as('buyer',`select * from payout_accounts`)).rows.length===0,'others cannot read payout accounts');
+const pend=(await svc(`select internal_pending_payouts('${U.winner}') j`)).rows[0].j;
+ok(pend.length===1&&pend[0].transfer_cents===9000,'pending payout listed once account ready');
+await svc(`select internal_record_transfer('${pend[0].payment_id}','tr_1')`);
+ok(await pst(P1)==='released','transfer recorded → released');
+ok((await svc(`select internal_pending_payouts('${U.winner}') j`)).rows[0].j.length===0,'no double payout');
+// refund path
+const P2=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Refund job') returning id`)).rows[0].id;
+const P2O=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${P2}','${U.winner}',40) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${P2O}','${P2}')`);
+r12=(await svc(`select internal_prepare_payment('${P2}','${U.buyer}') j`)).rows[0].j;
+await svc(`select internal_set_checkout_session('${r12.payment_id}','cs_test_2')`); await svc(`select internal_mark_paid('cs_test_2','pi_2','ch_2',4000)`);
+const rf=(await svc(`select internal_check_refundable('${P2}','${U.buyer}') j`)).rows[0].j;
+ok(rf.payment_intent==='pi_2','refundable before start');
+await svc(`select internal_record_refund('${rf.payment_id}','re_1',true)`);
+ok(await pst(P2)==='refunded'&&await st(P2)==='cancelled','refund recorded and WANT cancelled');
+ok(await cnt('winner',`kind='want_cancelled' and intent_id='${P2}'`)===1,'provider told about refund-cancel');
+// unpaid cancel voids checkout; late payment flagged for refund
+const P3=(await as('buyer',`insert into intents(buyer_id,description) values('${U.buyer}','Void job') returning id`)).rows[0].id;
+const P3O=(await as('winner',`insert into offers(intent_id,provider_id,amount) values('${P3}','${U.winner}',30) returning id`)).rows[0].id;
+await as('buyer',`select accept_offer('${P3O}','${P3}')`);
+r12=(await svc(`select internal_prepare_payment('${P3}','${U.buyer}') j`)).rows[0].j; await svc(`select internal_set_checkout_session('${r12.payment_id}','cs_test_3')`);
+await as('buyer',`select cancel_intent('${P3}')`);
+ok(await pst(P3)==='void','unpaid checkout voided on cancel');
+ok((await svc(`select internal_mark_paid('cs_test_3','pi_3','ch_3',3000) j`)).rows[0].j.needs_refund===true,'payment arriving after cancel is flagged for refund');
+await db.exec(`reset role; update app_config set payments_enabled=false;`);
 console.log(`\n${pass} passed, ${fail} failed`);
