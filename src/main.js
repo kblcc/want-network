@@ -31,7 +31,7 @@ function wireCategoryGuess(textarea,select){
   select.addEventListener('change',()=>{touched=true;});
   textarea.addEventListener('input',()=>{ if(touched)return; const g=guessCategory(textarea.value); select.value=g; select.classList.toggle('guessed',!!g); });
 }
-let marketState={intents:[],mine:new Map(),cat:'mine',loc:''};
+let marketState={intents:[],mine:new Map(),cat:'mine',picked:null,loc:''};
 const app=$('#app');
 
 function bell(){
@@ -409,7 +409,7 @@ function renderMarket(){
   const total=marketState.intents.length;
   list.innerHTML=rows.length?`<p class="hint">${rows.length} of ${total} open WANT${total===1?'':'s'}</p>${rows.map(i=>window.__marketCard(i)).join('')}`
     :`<div class="empty">${total?`No open WANTs match these filters. <button type="button" class="link" id="clearF">Show all</button>`:'No open WANTs right now.'}</div>`;
-  $('#clearF')?.addEventListener('click',()=>{marketState.cat='all';marketState.loc='';$('#fCat').value='all';$('#fLoc').value='';renderMarket();});
+  $('#clearF')?.addEventListener('click',()=>{marketState.cat=marketState.picked='all';marketState.loc='';$('#fCat').value='all';$('#fLoc').value='';renderMarket();});
 }
 
 async function providerDash(){
@@ -422,15 +422,15 @@ async function providerDash(){
   await loadReputation([...(intents||[]).map(i=>i.buyer_id),...(offers||[]).map(o=>o.intents?.buyer_id)]);
   const mine=new Map((offers||[]).map(o=>[o.intent_id,o]));
   const myCats=profile?.categories||[];
-  marketState={intents:intents||[],mine,cat:myCats.length?(marketState.cat||'mine'):'all',loc:marketState.loc||''};
-  if(!myCats.length&&marketState.cat==='mine')marketState.cat='all';
+  const picked=marketState.picked;
+  marketState={intents:intents||[],mine,picked,loc:marketState.loc||'',cat:picked&&(picked!=='mine'||myCats.length)?picked:(myCats.length?'mine':'all')};
   window.__marketCard=i=>{const existing=mine.get(i.id);return `<article class="card${myCats.includes(i.category)?' is-match':''}">${catChip(i.category)}${myCats.includes(i.category)?'<span class="match-tag">Matches your services</span>':''}<h3>${esc(i.description)}</h3><p>${esc(i.location||'Location flexible')} • ${i.budget_max?'Budget ≤ $'+i.budget_max:'Budget open'}${i.deadline?' • Due '+formatDate(i.deadline):''}</p><p class="who">Buyer: ${personLink(i.buyer_id,i.profiles?.display_name||'WANT member')} ${ratingBadge(i.buyer_id)}</p>${existing?`<p class="notice">Offer sent ✓ $${existing.amount} • ${esc(existing.status)}</p>`:`<form onsubmit="makeOffer(event,'${i.id}')"><div class="row"><input name="amount" type="number" min="0" step="0.01" required placeholder="Your offer"><input name="message" maxlength="500" placeholder="Message / terms"><button>Send offer</button></div></form>`}</article>`;};
   const market='<div id="marketList"></div>';
   const myOffers=(offers||[]).map(providerOfferCard).join('');
   const incomplete=!profile?.display_name||(!profile?.bio&&!(profile?.services||[]).length);
   shell(`<section>${incomplete?`<div class="card nudge"><div><b>Complete your profile</b><p>Buyers choose providers they trust. Add your name, the services you offer and a short bio.</p></div><button type="button" class="primary" data-go="editProfile">Complete profile</button></div>`:''}<p class="eyebrow">PROVIDER DASHBOARD</p><h2>Open WANTs</h2><div class="filters"><select id="fCat" aria-label="Category">${myCats.length?`<option value="mine">⭐ My services</option>`:''}<option value="all">All categories</option>${CATEGORIES.map(([k,l,ic])=>`<option value="${k}">${ic} ${esc(l)}</option>`).join('')}</select><input id="fLoc" type="search" placeholder="Filter by city or area" aria-label="Location" value="${escAttr(marketState.loc)}"></div>${myCats.length?'':`<p class="hint">Tip: choose the categories you serve in <button type="button" class="link small-inline" data-go="editProfile">your profile</button> to filter and get notified about matching WANTs.</p>`}${market}<div class="head provider-offers-head"><div><p class="eyebrow">YOUR ACTIVITY</p><h2>My Offers</h2></div></div>${myOffers||'<div class="empty">You have not sent any offers yet.</div>'}</section>`);
   $('#fCat').value=marketState.cat;
-  $('#fCat').onchange=e=>{marketState.cat=e.target.value;renderMarket();};
+  $('#fCat').onchange=e=>{marketState.cat=marketState.picked=e.target.value;renderMarket();};
   $('#fLoc').oninput=e=>{marketState.loc=e.target.value;renderMarket();};
   renderMarket();
 }
